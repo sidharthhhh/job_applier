@@ -9,18 +9,19 @@ import os
 import time
 import random
 import sys
-from playwright.sync_api import sync_playwright, BrowserContext, Page
+from playwright.sync_api import sync_playwright, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config  # Used for HEADLESS setting
 
 COOKIE_FILE = os.path.join(os.path.dirname(__file__), "..", "session", "cookies.json")
 SESSION_DIR  = os.path.join(os.path.dirname(__file__), "..", "session")
+PROFILE_DIR  = os.path.join(SESSION_DIR, "chrome_profile")
 
-# ── Realistic Chrome versions to rotate ───────────────────────────────────────
+# ── Realistic Chrome versions to rotate (only used as fallback UA) ──────────
 CHROME_VERSIONS = [
-    "120.0.0.0", "121.0.0.0", "122.0.0.0",
-    "123.0.0.0", "124.0.0.0", "125.0.0.0",
+    "131.0.0.0", "132.0.0.0", "133.0.0.0",
+    "134.0.0.0", "135.0.0.0", "136.0.0.0",
 ]
 
 # ── Realistic screen resolutions ──────────────────────────────────────────────
@@ -48,78 +49,14 @@ def get_random_viewport() -> dict:
     return random.choice(VIEWPORTS)
 
 
-# ── JS patches injected into every page ───────────────────────────────────────
+# ── Minimal JS patch injected into every page ────────────────────────────────
+# Real Chrome already provides authentic plugins, WebGL, CPU/RAM, and languages.
+# Overriding WebGL/plugins with synthetic values triggers LinkedIn bot checks.
 STEALTH_JS = """
-// 1. Hide webdriver flag (most important)
 Object.defineProperty(navigator, 'webdriver', {
     get: () => undefined,
     configurable: true
 });
-
-// 2. Realistic plugins list (empty = headless browser)
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [
-        { name: 'Chrome PDF Plugin',     filename: 'internal-pdf-viewer' },
-        { name: 'Chrome PDF Viewer',     filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-        { name: 'Native Client',         filename: 'internal-nacl-plugin' },
-    ],
-    configurable: true
-});
-
-// 3. Realistic languages
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en', 'hi'],
-    configurable: true
-});
-
-// 4. Proper hardware concurrency (real CPUs)
-Object.defineProperty(navigator, 'hardwareConcurrency', {
-    get: () => 8,
-    configurable: true
-});
-
-// 5. Realistic device memory
-Object.defineProperty(navigator, 'deviceMemory', {
-    get: () => 8,
-    configurable: true
-});
-
-// 6. Hide automation in chrome object
-if (window.chrome) {
-    window.chrome.runtime = window.chrome.runtime || {};
-}
-
-// 7. Realistic permissions API
-const originalQuery = window.navigator.permissions.query;
-window.navigator.permissions.query = (parameters) => (
-    parameters.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : originalQuery(parameters)
-);
-
-// 8. Hide headless in user agent data
-if (navigator.userAgentData) {
-    Object.defineProperty(navigator, 'userAgentData', {
-        get: () => ({
-            brands: [
-                { brand: 'Google Chrome',   version: '120' },
-                { brand: 'Chromium',        version: '120' },
-                { brand: 'Not=A?Brand',     version: '24'  },
-            ],
-            mobile: false,
-            platform: 'Windows',
-        }),
-        configurable: true
-    });
-}
-
-// 9. Realistic WebGL vendor/renderer
-const getParameter = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(parameter) {
-    if (parameter === 37445) return 'Intel Inc.';
-    if (parameter === 37446) return 'Intel Iris OpenGL Engine';
-    return getParameter.call(this, parameter);
-};
 """
 
 
@@ -131,7 +68,7 @@ def save_cookies(context: BrowserContext):
     """Save browser cookies to file"""
     ensure_session_dir()
     cookies = context.cookies()
-    with open(COOKIE_FILE, "w") as f:
+    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
         json.dump(cookies, f, indent=2)
     print(f"[Session] ✅ Cookies saved → {COOKIE_FILE}")
 
@@ -140,20 +77,20 @@ def load_cookies(context: BrowserContext) -> bool:
     """Load cookies from file. Returns True if loaded."""
     if not os.path.exists(COOKIE_FILE):
         return False
-    with open(COOKIE_FILE, "r") as f:
-        cookies = json.load(f)
-    context.add_cookies(cookies)
-    print("[Session] ✅ Cookies loaded from saved session")
-    return True
-
-
-def is_logged_in(page: Page) -> bool:
-    """Check if LinkedIn session is active"""
     try:
-        page.goto("https://www.linkedin.com/feed/", timeout=20000)
-        _human_pause(2, 4)
-        return "feed" in page.url or "mynetwork" in page.url
-    except Exception:
+        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+        if not isinstance(cookies, list) or not cookies:
+            return False
+        context.add_cookies(cookies)
+        print("[Session] ✅ Cookies loaded from saved session")
+        return True
+    except Exception as e:
+        print(f"[Session] ⚠️  Failed to load saved cookies ({e}) — removing stale file")
+        try:
+            os.remove(COOKIE_FILE)
+        except OSError:
+            pass
         return False
 
 
@@ -162,82 +99,89 @@ def _human_pause(min_s: float = 1.0, max_s: float = 3.0):
     time.sleep(random.uniform(min_s, max_s))
 
 
-def _build_login_context(playwright):
+def resilient_goto(page: Page, url: str, timeout_ms: int = 45000, retries: int = 2) -> bool:
     """
-    Browser context for MANUAL LOGIN only.
-    Uses real Chrome (channel='chrome') — LinkedIn cannot detect this as a bot.
-    Falls back to Chromium if Chrome is not installed.
-    NO tracker blocking — blocking breaks LinkedIn's login flow.
+    Navigate safely without failing on slow SPA analytics/assets.
+    Uses wait_until='commit' to resolve server redirects quickly, then softly waits
+    for DOMContentLoaded with retries on transient timeouts.
     """
-    ua = get_random_user_agent()
-    vp = get_random_viewport()
+    for attempt in range(1, retries + 1):
+        try:
+            page.goto(url, timeout=timeout_ms, wait_until="commit")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=20000)
+            except PlaywrightTimeoutError:
+                pass
+            return True
+        except PlaywrightTimeoutError:
+            print(f"[Session] ⚠️  Navigation timeout ({timeout_ms // 1000}s) on attempt {attempt}/{retries}: {url[:60]}")
+            if attempt < retries:
+                time.sleep(2)
+        except Exception as e:
+            print(f"[Session] ⚠️  Navigation error for {url[:60]}: {e}")
+            return False
+    return False
+
+
+def _build_persistent_context(playwright, headless: bool = False):
+    """
+    Launch a persistent Chrome profile in session/chrome_profile.
+    Preserves localStorage, IndexedDB, service workers, and device tokens
+    across runs so LinkedIn does not treat each run as a new device.
+    """
+    ensure_session_dir()
+    os.makedirs(PROFILE_DIR, exist_ok=True)
 
     common_args = [
         "--disable-blink-features=AutomationControlled",
         "--disable-infobars",
         "--no-sandbox",
-        "--start-maximized",
+        "--disable-dev-shm-usage",
     ]
+    if not headless:
+        common_args.append("--start-maximized")
 
-    # ── Try real Chrome first (least detectable) ──────────────
-    try:
-        browser = playwright.chromium.launch(
-            channel="chrome",     # Uses YOUR installed Chrome — not Playwright Chromium
-            headless=False,
-            args=common_args,
-        )
-        print("[Session] Using real Chrome browser for login (most trusted by LinkedIn)")
-    except Exception:
-        # Chrome not installed — fall back to Chromium
-        browser = playwright.chromium.launch(
-            headless=False,
-            args=common_args,
-        )
-        print("[Session] Chrome not found — using Chromium (may require extra verification)")
-
-    context = browser.new_context(
-        user_agent=ua,
-        viewport=vp,
-        locale="en-US",
-        timezone_id="Asia/Kolkata",
-        color_scheme="light",
-    )
-    context.add_init_script(STEALTH_JS)
-    return browser, context
-
-
-def _build_scrape_context(playwright):
-    """
-    Browser context for SCRAPING.
-    Uses real Chrome channel with default UA and viewport so cookies are never rejected.
-    """
-    common_args = [
-        "--disable-blink-features=AutomationControlled",
-        "--disable-infobars",
-        "--no-sandbox",
-        "--start-maximized",
-    ]
+    launch_kwargs = {
+        "user_data_dir": PROFILE_DIR,
+        "headless": headless,
+        "args": common_args,
+        "viewport": {"width": 1440, "height": 900},
+        "locale": "en-US",
+        "timezone_id": "Asia/Kolkata",
+        "color_scheme": "light",
+    }
+    if headless:
+        # Never expose 'HeadlessChrome' in User-Agent when running headless
+        launch_kwargs["user_agent"] = get_random_user_agent()
 
     try:
-        browser = playwright.chromium.launch(
+        context = playwright.chromium.launch_persistent_context(
             channel="chrome",
-            headless=Config.HEADLESS,
-            args=common_args,
+            **launch_kwargs,
         )
+        print(f"[Session] Using persistent real Chrome profile (headless={headless})")
     except Exception:
-        browser = playwright.chromium.launch(
-            headless=Config.HEADLESS,
-            args=common_args,
-        )
+        context = playwright.chromium.launch_persistent_context(**launch_kwargs)
+        print(f"[Session] Using persistent Chromium profile (headless={headless})")
 
-    context = browser.new_context(
-        viewport={"width": 1440, "height": 900},
-        locale="en-US",
-    )
-    # Stealth JS injected on every page
+    context.set_default_navigation_timeout(45000)
+    context.set_default_timeout(30000)
     context.add_init_script(STEALTH_JS)
+    page = context.pages[0] if context.pages else context.new_page()
+    return context, page
 
-    return browser, context
+
+def _build_login_context(playwright):
+    """Backward-compatible helper opening visible persistent login context."""
+    context, _page = _build_persistent_context(playwright, headless=False)
+    return context, context
+
+
+def _build_scrape_context(playwright, headless: bool | None = None):
+    """Backward-compatible helper opening persistent scrape context."""
+    use_headless = Config.HEADLESS if headless is None else headless
+    context, _page = _build_persistent_context(playwright, headless=use_headless)
+    return context, context
 
 
 def manual_login(page: Page, context: BrowserContext):
@@ -261,7 +205,7 @@ def manual_login(page: Page, context: BrowserContext):
     print("  This terminal will auto-detect when you are logged in.")
     print("=" * 60 + "\n")
 
-    page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded")
+    resilient_goto(page, "https://www.linkedin.com/login", timeout_ms=45000)
     _human_pause(1, 2)
 
     # ── Inject a BIG RED BANNER so user knows this is the right window ─
@@ -353,12 +297,8 @@ def manual_login(page: Page, context: BrowserContext):
     _human_pause(1, 2)
 
     # Navigate to feed explicitly to verify
-    try:
-        page.goto("https://www.linkedin.com/feed/",
-                  timeout=15000, wait_until="domcontentloaded")
-        _human_pause(2, 3)
-    except Exception:
-        pass
+    resilient_goto(page, "https://www.linkedin.com/feed/", timeout_ms=30000)
+    _human_pause(2, 3)
 
     if any(p in page.url for p in ["/feed", "/mynetwork", "/home"]):
         save_cookies(context)
@@ -369,56 +309,94 @@ def manual_login(page: Page, context: BrowserContext):
     raise Exception("LinkedIn login could not be confirmed")
 
 
+def _is_on_feed(url: str) -> bool:
+    return any(x in url for x in ["/feed", "/mynetwork", "/home"])
+
+
 def get_authenticated_browser():
     """
     Main entry point.
-    Returns (playwright, browser, context, page) — logged in & stealth-ready.
+    Returns (playwright, browser_handle, context, page) — logged in & persistent.
 
     Flow:
-    - Saved cookies exist + valid  → use them (fully automatic, scrape context)
-    - No cookies / expired         → open login browser, wait for manual login,
-                                     save cookies, return scrape context
+    - Open persistent Chrome profile (session/chrome_profile)
+    - Check if session is already active on /feed/; if not, seed session/cookies.json
+    - If cookies are expired or redirected to login, open visible browser for manual login
     """
     playwright = sync_playwright().start()
+    active_context = None
 
-    # ── STEP 1: Try saved cookies with scrape context ─────────
-    if os.path.exists(COOKIE_FILE):
-        print("[Session] Found saved cookies — trying to restore session...")
-        browser, context = _build_scrape_context(playwright)
-        page = context.new_page()
-        load_cookies(context)
+    try:
+        # ── STEP 1: Open persistent profile and verify session ──────
+        context, page = _build_persistent_context(playwright, headless=Config.HEADLESS)
+        active_context = context
 
-        page.goto("https://www.linkedin.com/feed/", timeout=20000,
-                  wait_until="domcontentloaded")
+        # Seed persistent profile with cookies.json before first request if li_at isn't present yet
+        existing_cookies = context.cookies("https://www.linkedin.com")
+        has_li_at = any(c.get("name") == "li_at" for c in existing_cookies)
+        if not has_li_at and os.path.exists(COOKIE_FILE):
+            print("[Session] Seeding persistent profile from cookies.json...")
+            load_cookies(context)
+
+        loaded = resilient_goto(page, "https://www.linkedin.com/feed/", timeout_ms=45000)
         _human_pause(2, 4)
 
-        if any(x in page.url for x in ["/feed", "/mynetwork", "/home"]):
-            print("[Session] ✅ Session restored via saved cookies!")
-            return playwright, browser, context, page
-        else:
-            print("[Session] ⚠️  Cookies expired. Opening browser for re-login...")
-            browser.close()
-            os.remove(COOKIE_FILE)
+        if _is_on_feed(page.url):
+            save_cookies(context)
+            print("[Session] ✅ Session active via persistent Chrome profile!")
+            return playwright, context, context, page
 
-    # ── STEP 2: Manual login with clean login context ─────────
-    login_browser, login_context = _build_login_context(playwright)
-    login_page = login_context.new_page()
+        # If headless timed out (not redirected to login), retry in visible mode
+        if (not loaded or "linkedin.com" not in page.url) and Config.HEADLESS:
+            print("[Session] ⚠️  Headless feed check timed out — retrying in visible Chrome...")
+            context.close()
+            active_context = None
+            context, page = _build_persistent_context(playwright, headless=False)
+            active_context = context
+            loaded = resilient_goto(page, "https://www.linkedin.com/feed/", timeout_ms=45000)
+            _human_pause(2, 4)
+            if _is_on_feed(page.url):
+                save_cookies(context)
+                print("[Session] ✅ Session restored in visible Chrome!")
+                return playwright, context, context, page
 
-    manual_login(login_page, login_context)
+        # Session genuinely expired / logged out
+        if os.path.exists(COOKIE_FILE):
+            print(f"[Session] ⚠️  Saved session expired ({page.url[:60]}). Re-login required...")
+            try:
+                os.remove(COOKIE_FILE)
+            except OSError:
+                pass
 
-    # ── STEP 3: Close login browser, open scrape context ──────
-    # Load freshly saved cookies into the stealth scrape context
-    login_browser.close()
+        # Ensure visible window for manual login
+        if Config.HEADLESS:
+            context.close()
+            active_context = None
+            context, page = _build_persistent_context(playwright, headless=False)
+            active_context = context
 
-    print("[Session] Starting stealth scrape session...")
-    scrape_browser, scrape_context = _build_scrape_context(playwright)
-    scrape_page = scrape_context.new_page()
-    load_cookies(scrape_context)
+        manual_login(page, context)
 
-    # Verify scrape session works
-    scrape_page.goto("https://www.linkedin.com/feed/", timeout=20000,
-                     wait_until="domcontentloaded")
-    _human_pause(2, 3)
+        # If user prefers headless scraping, restart in headless mode with refreshed profile
+        if Config.HEADLESS:
+            context.close()
+            active_context = None
+            print("[Session] Switching back to headless scrape profile...")
+            context, page = _build_persistent_context(playwright, headless=True)
+            active_context = context
+            resilient_goto(page, "https://www.linkedin.com/feed/", timeout_ms=45000)
+            _human_pause(2, 3)
 
-    print("[Session] ✅ Stealth scrape session ready!")
-    return playwright, scrape_browser, scrape_context, scrape_page
+        print("[Session] ✅ Persistent scrape session ready!")
+        return playwright, context, context, page
+    except Exception:
+        if active_context is not None:
+            try:
+                active_context.close()
+            except Exception:
+                pass
+        try:
+            playwright.stop()
+        except Exception:
+            pass
+        raise

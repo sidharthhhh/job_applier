@@ -5,6 +5,7 @@ LinkedIn Post Scraper → Email Extractor → MongoDB Dedup → Ollama AI → SM
 Run: python main.py
 """
 
+import argparse
 import sys
 import os
 import time
@@ -18,9 +19,14 @@ from database.mongo_handler import MongoHandler
 from scraper.session_manager import get_authenticated_browser
 from scraper.linkedin_scraper import run_scraper
 from scraper.email_extractor import extract_emails_from_posts
-from ai.ollama_handler import generate_email_body, generate_subject_line, check_ollama_status
+from ai.llm_handler import (
+    check_llm_status,
+    generate_email_body,
+    generate_email_content,
+    generate_subject_line,
+)
 from ai.relevance_filter import is_job_relevant
-from mailer.email_verifier import verify_email
+from mailer.email_verifier import verify_email, is_personal_email
 from mailer.smtp_handler import SMTPHandler
 
 
@@ -54,10 +60,39 @@ def print_step(step: int, title: str):
     print(f"{'='*55}")
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse optional CLI overrides for dry-run and scrape mode."""
+    parser = argparse.ArgumentParser(description="LinkedIn AI Job Application Automator")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run scraping, filtering, verification, and AI drafting without sending SMTP emails",
+    )
+    parser.add_argument(
+        "--test-smtp",
+        action="store_true",
+        help="Test SMTP login/connection with current .env settings and exit",
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--email-only",
+        action="store_true",
+        help="Skip LinkedIn scraping and process the existing MongoDB backlog",
+    )
+    mode_group.add_argument(
+        "--scrape",
+        action="store_true",
+        help="Force full scraping + email pipeline regardless of SCRAPE_MODE in .env",
+    )
+    return parser.parse_args(argv)
+
+
 def run_pipeline():
     """Main pipeline execution"""
     print_banner()
     print_mode_banner(Config.SCRAPE_MODE)
+    if Config.DRY_RUN:
+        print("  🧪 DRY RUN ENABLED — Emails will be drafted and previewed, NOT sent.\n")
     start_time = datetime.now()
 
     # ── Validate Config ────────────────────────────────────
@@ -69,16 +104,32 @@ def run_pipeline():
         print(f"\n{e}")
         sys.exit(1)
 
-    # ── Check Ollama Status ────────────────────────────────
-    print("\n[Init] Checking Ollama status...")
-    ollama_status = check_ollama_status()
-    if ollama_status["running"]:
-        print(f"[Init] ✅ Ollama running | Model '{Config.OLLAMA_MODEL}' available: {ollama_status['model_available']}")
-        if not ollama_status["model_available"]:
-            print(f"[Init] ⚠️  Available models: {ollama_status['available_models']}")
-            print(f"[Init] ⚠️  Run: ollama pull {Config.OLLAMA_MODEL}")
+    # ── Check AI Provider Status ───────────────────────────
+    print(f"\n[Init] Checking AI provider ({Config.AI_PROVIDER})...")
+    llm_status = check_llm_status()
+    if llm_status["running"]:
+        print(
+            f"[Init] ✅ {Config.AI_PROVIDER.upper()} ready | "
+            f"Model '{llm_status['configured_model']}' available: {llm_status['model_available']} "
+            f"({llm_status.get('note', '')})"
+        )
+        if not llm_status["model_available"] and llm_status.get("available_models"):
+            print(f"[Init] ⚠️  Available models: {llm_status['available_models']}")
     else:
-        print("[Init] ⚠️  Ollama not running. Will use fallback email template.")
+        print(f"[Init] ⚠️  {llm_status.get('note', 'AI provider unavailable')}.")
+
+    fb_status = llm_status.get("fallback")
+    if fb_status:
+        fb_name = fb_status["provider"].upper()
+        if fb_status["running"]:
+            print(
+                f"[Init] 🔁 Fallback {fb_name} ready | "
+                f"Model '{fb_status['configured_model']}' available: {fb_status['model_available']}"
+            )
+        else:
+            print(f"[Init] ⚠️  Fallback {fb_name} not ready ({fb_status.get('note', '')}) — DevOps templates will be used if primary fails.")
+    elif not llm_status["running"]:
+        print("[Init] ℹ️  Will use DevOps fallback email templates.")
 
     # ── Connect to MongoDB ─────────────────────────────────
     print("\n[Init] Connecting to MongoDB...")
@@ -87,6 +138,7 @@ def run_pipeline():
     # ── Track totals for summary (initialized here so always defined) ──────
     all_posts = []
     email_records = []
+    newly_saved_emails: set[str] = set()
 
     if Config.SCRAPE_MODE:
         # ─────────────────────────────────────────────────────────
@@ -142,27 +194,36 @@ def run_pipeline():
             for record in email_records:
                 if db.save_email(record):
                     new_emails += 1
+                    newly_saved_emails.add(record["email"].lower().strip())
             print(f"[Pipeline] 💾 {new_emails} new emails saved | {len(email_records) - new_emails} already in DB")
         else:
-            print("[Pipeline] ℹ️  No relevant posts — will still check MongoDB backlog below.")
+            print("[Pipeline] ℹ️  No relevant posts found in this scrape.")
 
     else:
         # ─────────────────────────────────────────────────────────
         # SCRAPE_MODE = false → skip Steps 1-3 entirely
         # ─────────────────────────────────────────────────────────
         print("\n[Pipeline] ⏭️  SCRAPE_MODE=false — Skipping Steps 1-3 (no browser launched)")
-        print("[Pipeline] 📂 Loading emails directly from MongoDB backlog...")
+        print("[Pipeline] 📂 Loading unsent pending emails from MongoDB backlog...")
 
     # ─────────────────────────────────────────────────────────
-    # STEP 4: Filter via MongoDB (Cooldown Check)
+    # STEP 4: Filter via MongoDB (Newly Scraped / Pending Only)
     # ─────────────────────────────────────────────────────────
-    print_step(4, f"COOLDOWN FILTER ({Config.EMAIL_COOLDOWN_DAYS} DAYS)")
+    print_step(4, "FILTER NEWLY SCRAPED / PENDING EMAILS")
 
-    pending_emails = db.get_pending_emails()
+    if Config.SCRAPE_MODE:
+        if not newly_saved_emails:
+            print("[Pipeline] ℹ️  No new emails scraped in this run (skipping already-saved emails in DB).")
+            print("[Pipeline]    Run with --email-only if you want to send unsent pending backlog.")
+            db.close()
+            return
+        pending_emails = db.get_pending_emails(only_emails=newly_saved_emails)
+        print(f"[Pipeline] 🆕 {len(pending_emails)} newly scraped email(s) queued (saved DB backlog skipped)")
+    else:
+        pending_emails = db.get_pending_emails()
 
     if not pending_emails:
-        print(f"[Pipeline] ✅ All emails are on cooldown (mailed within last {Config.EMAIL_COOLDOWN_DAYS} days)")
-        print("[Pipeline] Nothing to send today.")
+        print("[Pipeline] ✅ No unsent pending emails to process.")
         db.close()
         return
 
@@ -171,13 +232,27 @@ def run_pipeline():
     # ─────────────────────────────────────────────────────────
     print_step(5, "VERIFY RECIPIENT EMAILS (DNS & MX RECORDS)")
 
+    sent_today = db.get_sent_count_today()
+    remaining_quota = max(0, Config.MAX_EMAILS_PER_DAY - sent_today)
+    if remaining_quota == 0:
+        print(f"[Pipeline] ⚠️  Daily limit already reached ({sent_today}/{Config.MAX_EMAILS_PER_DAY} sent today). Stopping.")
+        db.close()
+        return
+
     verified_emails = []
     for record in pending_emails:
         target_email = record.get("email", "")
+
+        if Config.SKIP_PERSONAL_EMAILS and is_personal_email(target_email):
+            print(f"[Verifier] ⏭️  Skipping personal email (SKIP_PERSONAL_EMAILS=true): {target_email}")
+            continue
+
         is_valid, reason = verify_email(target_email)
         if is_valid:
             verified_emails.append(record)
             print(f"[Verifier] ✅ {target_email} -> Active Mail Server confirmed")
+            if len(verified_emails) >= remaining_quota:
+                break
         else:
             print(f"[Verifier] ⚠️  Skipping {target_email}: {reason}")
             db.mark_email_invalid(target_email, reason)
@@ -187,27 +262,28 @@ def run_pipeline():
         db.close()
         return
 
-    # Respect daily max limit
-    if len(verified_emails) > Config.MAX_EMAILS_PER_DAY:
-        print(f"[Pipeline] ⚠️  {len(verified_emails)} emails verified, limiting to {Config.MAX_EMAILS_PER_DAY}/day")
-        verified_emails = verified_emails[:Config.MAX_EMAILS_PER_DAY]
-
-    print(f"[Pipeline] 🎯 {len(verified_emails)} verified emails ready to send")
+    print(f"[Pipeline] 🎯 {len(verified_emails)} verified emails ready to send (remaining daily quota: {remaining_quota})")
 
     # ─────────────────────────────────────────────────────────
-    # STEP 6: Generate AI Emails via Ollama
+    # STEP 6: Generate AI Emails
     # ─────────────────────────────────────────────────────────
-    print_step(6, f"GENERATE EMAILS WITH OLLAMA ({Config.OLLAMA_MODEL.upper()})")
+    model_map = {
+        "bedrock": Config.BEDROCK_MODEL_ID,
+        "gemini": Config.GEMINI_MODEL,
+        "ollama": Config.OLLAMA_MODEL,
+    }
+    active_model = model_map.get(Config.AI_PROVIDER, Config.BEDROCK_MODEL_ID)
+    fb_label = f" | FALLBACK: {Config.AI_FALLBACK_PROVIDER.upper()}" if Config.AI_FALLBACK_PROVIDER not in ("", "none", Config.AI_PROVIDER) else ""
+    print_step(6, f"GENERATE EMAILS WITH {Config.AI_PROVIDER.upper()} ({active_model}){fb_label}")
 
     email_queue = []
     for i, record in enumerate(verified_emails, 1):
-        print(f"\n[Ollama] [{i}/{len(verified_emails)}] Generating email for: {record['email']}")
+        print(f"\n[{Config.AI_PROVIDER.upper()}] [{i}/{len(verified_emails)}] Generating email for: {record['email']}")
 
-        post_text = record.get("post_text", "AI/ML job opportunity")
+        post_text = record.get("post_text", f"{Config.YOUR_ROLE} job opportunity")
         company = record.get("company", "")
 
-        body = generate_email_body(post_text, company)
-        subject = generate_subject_line(post_text, company)
+        subject, body = generate_email_content(post_text, company)
 
         email_queue.append({
             "email": record["email"],
@@ -217,48 +293,64 @@ def run_pipeline():
             "company": company,
         })
 
-        # Brief delay between Ollama calls
-        if i < len(verified_emails):
-            time.sleep(2)
+        # Local Ollama benefits from brief cooldown; Bedrock pacing is managed in llm_handler
+        if Config.AI_PROVIDER == "ollama" and i < len(verified_emails):
+            time.sleep(2.0)
 
     # ─────────────────────────────────────────────────────────
-    # STEP 7: Send Emails via SMTP
+    # STEP 7: Send Emails via SMTP (or Preview in Dry Run)
     # ─────────────────────────────────────────────────────────
-    print_step(7, "SEND EMAILS VIA SMTP")
+    if Config.DRY_RUN:
+        print_step(7, "DRY RUN PREVIEW (SMTP SKIPPED)")
+        for i, item in enumerate(email_queue, 1):
+            print(f"\n[DryRun] [{i}/{len(email_queue)}] To: {item['email']}")
+            print(f"[DryRun] Subject: {item['subject']}")
+            print(f"[DryRun] Body preview: {item['body'][:220].replace(chr(10), ' ')}...")
+        results = [{"email": item["email"], "status": "dry_run"} for item in email_queue]
+        print_step(8, "LOG RESULTS TO MONGODB (SKIPPED IN DRY RUN)")
+    else:
+        print_step(7, "SEND EMAILS VIA SMTP")
 
-    mailer = SMTPHandler()
+        mailer = SMTPHandler()
 
-    # Test connection first
-    if not mailer.test_connection():
-        print("[Pipeline] ❌ SMTP connection failed. Check your .env SMTP settings.")
-        db.close()
-        return
+        # Test connection first
+        if not mailer.test_connection():
+            print("[Pipeline] ❌ SMTP connection failed. Check your .env SMTP settings.")
+            db.close()
+            return
 
-    results = mailer.send_batch(email_queue)
+        results = []
 
-    # ─────────────────────────────────────────────────────────
-    # STEP 8: Log Results to MongoDB
-    # ─────────────────────────────────────────────────────────
-    print_step(8, "LOG RESULTS TO MONGODB")
+        def _persist_result(item: dict, result: dict):
+            results.append(result)
+            if result["status"] == "sent":
+                db.log_sent_email(
+                    email=result["email"],
+                    subject=item.get("subject", ""),
+                    body=item.get("body", ""),
+                    post_url=result.get("post_url", ""),
+                    company=result.get("company", ""),
+                )
+            elif result["status"] == "failed":
+                if result.get("permanent_failure"):
+                    db.update_email_status(result["email"], "bounced")
+                else:
+                    print(f"[Pipeline] ⚠️  Transient send failure for {result['email']} — keeping pending for retry")
 
-    for result in results:
-        if result["status"] == "sent":
-            # Find matching email queue item for body/subject
-            matched = next((e for e in email_queue if e["email"] == result["email"]), {})
-            db.log_sent_email(
-                email=result["email"],
-                subject=matched.get("subject", ""),
-                body=matched.get("body", ""),
-                post_url=result.get("post_url", ""),
-                company=result.get("company", ""),
-            )
-        elif result["status"] == "failed":
-            db.update_email_status(result["email"], "bounced")
+        try:
+            mailer.send_batch(email_queue, on_result=_persist_result)
+        except KeyboardInterrupt:
+            print("\n[Pipeline] ⚠️  Batch interrupted — already-sent emails were saved to MongoDB.")
+
+        # ─────────────────────────────────────────────────────────
+        # STEP 8: Log Results to MongoDB (Persisted per email above)
+        # ─────────────────────────────────────────────────────────
+        print_step(8, "MONGODB SYNC COMPLETE")
 
     # ─────────────────────────────────────────────────────────
     # FINAL SUMMARY
     # ─────────────────────────────────────────────────────────
-    elapsed = (datetime.now() - start_time).seconds
+    elapsed = int((datetime.now() - start_time).total_seconds())
     stats = db.get_stats()
 
     mode_str = "🟢 FULL PIPELINE" if Config.SCRAPE_MODE else "🟡 EMAIL-ONLY MODE"
@@ -290,4 +382,19 @@ def run_pipeline():
 
 
 if __name__ == "__main__":
+    args = parse_args()
+    if args.test_smtp:
+        try:
+            Config.validate()
+        except ValueError as e:
+            print(f"\n{e}")
+            sys.exit(1)
+        ok = SMTPHandler().test_connection()
+        sys.exit(0 if ok else 1)
+    if args.dry_run:
+        Config.DRY_RUN = True
+    if args.email_only:
+        Config.SCRAPE_MODE = False
+    elif args.scrape:
+        Config.SCRAPE_MODE = True
     run_pipeline()

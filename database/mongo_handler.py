@@ -4,8 +4,9 @@ Handles all MongoDB operations for the LinkedIn Scraper pipeline
 """
 
 from datetime import datetime, timedelta
-from pymongo import MongoClient, ASCENDING
-from pymongo.errors import DuplicateKeyError
+import hashlib
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.errors import DuplicateKeyError, OperationFailure
 import sys
 import os
 
@@ -15,7 +16,8 @@ from config import Config
 
 class MongoHandler:
     def __init__(self):
-        self.client = MongoClient(Config.MONGO_URI)
+        self.client = MongoClient(Config.MONGO_URI, serverSelectionTimeoutMS=5000)
+        self.client.admin.command("ping")
         self.db = self.client[Config.MONGO_DB]
 
         # Collections
@@ -31,17 +33,39 @@ class MongoHandler:
         """Create indexes for faster queries and uniqueness"""
         # Unique email in extracted_emails
         self.emails.create_index([("email", ASCENDING)], unique=True)
-        # Index on sent_at for cooldown queries
-        self.sent.create_index([("email", ASCENDING), ("sent_at", ASCENDING)])
-        # Unique post_url to avoid duplicate post scraping
-        self.posts.create_index([("post_url", ASCENDING)], unique=True)
+        # Index on sent_at for cooldown and daily quota queries
+        self.sent.create_index([("email", ASCENDING), ("sent_at", DESCENDING)])
+        self.sent.create_index([("sent_at", DESCENDING)])
+
+        # Partial unique index on non-empty post_url so posts lacking URLs don't collide on ""
+        try:
+            existing = self.posts.index_information()
+            if "post_url_1" in existing and "partialFilterExpression" not in existing["post_url_1"]:
+                self.posts.drop_index("post_url_1")
+            self.posts.create_index(
+                [("post_url", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"post_url": {"$type": "string", "$gt": ""}},
+            )
+        except OperationFailure:
+            self.posts.create_index([("post_url", ASCENDING)])
+
+        self.posts.create_index(
+            [("content_hash", ASCENDING)],
+            unique=True,
+            partialFilterExpression={"content_hash": {"$type": "string", "$gt": ""}},
+        )
 
     # ─── POSTS ──────────────────────────────────────────────
     def save_post(self, post: dict) -> bool:
         """Save scraped LinkedIn post. Returns True if new, False if duplicate."""
-        post["scraped_at"] = datetime.utcnow()
+        doc = dict(post)
+        doc["scraped_at"] = datetime.utcnow()
+        text_sample = (doc.get("post_text") or "").strip()[:250].lower()
+        if text_sample:
+            doc["content_hash"] = hashlib.sha256(text_sample.encode("utf-8")).hexdigest()
         try:
-            self.posts.insert_one(post)
+            self.posts.insert_one(doc)
             return True
         except DuplicateKeyError:
             return False
@@ -53,11 +77,13 @@ class MongoHandler:
     # ─── EMAILS ─────────────────────────────────────────────
     def save_email(self, email_data: dict) -> bool:
         """Save extracted email. Returns True if new, False if already exists."""
-        email_data["extracted_at"] = datetime.utcnow()
-        if "status" not in email_data:
-            email_data["status"] = "pending"
+        doc = dict(email_data)
+        doc["email"] = doc["email"].lower().strip()
+        doc["extracted_at"] = datetime.utcnow()
+        if "status" not in doc:
+            doc["status"] = "pending"
         try:
-            self.emails.insert_one(email_data)
+            self.emails.insert_one(doc)
             return True
         except DuplicateKeyError:
             return False
@@ -81,17 +107,34 @@ class MongoHandler:
             {"$set": {"status": "invalid", "invalid_reason": reason, "updated_at": datetime.utcnow()}}
         )
 
-    def get_pending_emails(self) -> list:
-        """Get emails extracted but not yet sent, excluding invalid/bounced ones"""
-        query = {
-            "status": {"$nin": ["invalid", "invalid_mx", "bounced"]}
-        }
+    def get_pending_emails(self, only_emails: set[str] | None = None) -> list:
+        """
+        Get unsent pending emails, excluding already sent/invalid/bounced/replied ones.
+        If only_emails is provided, restrict strictly to those newly scraped addresses.
+        """
+        query: dict = {"status": "pending"}
+        if only_emails is not None:
+            normalized = [e.lower().strip() for e in only_emails if e]
+            if not normalized:
+                return []
+            query["email"] = {"$in": normalized}
+
         all_emails = list(self.emails.find(query, {"_id": 0}))
-        pending = []
-        for e in all_emails:
-            if not self.is_email_on_cooldown(e["email"]):
-                pending.append(e)
-        return pending
+        if not all_emails:
+            return []
+
+        cutoff = datetime.utcnow() - timedelta(days=Config.EMAIL_COOLDOWN_DAYS)
+        cooled_down = {
+            e.lower().strip()
+            for e in self.sent.distinct("email", {"sent_at": {"$gte": cutoff}})
+            if isinstance(e, str)
+        }
+        return [e for e in all_emails if e.get("email", "").lower().strip() not in cooled_down]
+
+    def get_sent_count_today(self) -> int:
+        """Count emails sent since start of current UTC day."""
+        today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.sent.count_documents({"sent_at": {"$gte": today}})
 
     # ─── SENT EMAILS ────────────────────────────────────────
     def log_sent_email(self, email: str, subject: str, body: str,
@@ -119,12 +162,13 @@ class MongoHandler:
         return str(result.inserted_id)
 
     def update_email_status(self, email: str, status: str):
-        """Update status in both sent_emails and extracted_emails (e.g., bounced, replied, invalid)"""
+        """Update status on the latest sent_emails entry and extracted_emails"""
         norm_email = email.lower().strip()
         now = datetime.utcnow()
-        self.sent.update_one(
+        self.sent.find_one_and_update(
             {"email": norm_email},
-            {"$set": {"status": status, "updated_at": now}}
+            {"$set": {"status": status, "updated_at": now}},
+            sort=[("sent_at", DESCENDING)],
         )
         self.emails.update_one(
             {"email": norm_email},

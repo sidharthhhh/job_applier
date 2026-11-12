@@ -9,8 +9,6 @@ import time
 import random
 import os
 import sys
-import uuid
-from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -56,13 +54,13 @@ def attach_signature(body: str) -> str:
     import re
     # Remove any signature AI may have added (after "Best regards" / "Thanks" etc.)
     body = re.split(
-        r'\n(?:Best regards?|Thanks?|Regards?|Warm regards?|Cheers?|Sincerely)[,\s]*\n',
+        r'\n(?:Best regards?|Thanks?|Regards?|Warm regards?|Cheers?|Sincerely)[,\s]*(?:\n|$)',
         body,
         flags=re.IGNORECASE
     )[0].rstrip()
 
     # Also strip if AI wrote a "--" separator already
-    body = re.split(r'\n--\n', body)[0].rstrip()
+    body = re.split(r'\n--(?:\n|$)', body)[0].rstrip()
 
     return body + "\n" + build_signature()
 
@@ -111,13 +109,22 @@ class SMTPHandler:
         self.password   = Config.SMTP_PASSWORD
         self.resume_path = Config.RESUME_PATH
         self._sent_count = 0
+        self._resume_bytes: bytes | None = None
+        self._resume_name = os.path.basename(self.resume_path)
+        if os.path.exists(self.resume_path):
+            with open(self.resume_path, "rb") as f:
+                self._resume_bytes = f.read()
 
     def _connect(self) -> smtplib.SMTP:
-        """Authenticated SMTP connection"""
-        server = smtplib.SMTP(self.smtp_host, self.smtp_port)
-        server.ehlo()
-        server.starttls()
-        server.ehlo()   # Re-identify after STARTTLS (important!)
+        """Authenticated SMTP connection (supports SSL on 465 and STARTTLS on 587)."""
+        if self.smtp_port == 465:
+            server = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=30)
+            server.ehlo()
+        else:
+            server = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()   # Re-identify after STARTTLS (important!)
         server.login(self.email, self.password)
         return server
 
@@ -134,10 +141,12 @@ class SMTPHandler:
         msg = MIMEMultipart("mixed")
 
         # ── Standard email headers ─────────────────────────────
+        sender_domain = self.email.split("@")[-1] if "@" in self.email else None
         msg["From"]       = formataddr((Config.YOUR_NAME, self.email))
         msg["To"]         = to_email
         msg["Subject"]    = subject
         msg["Date"]       = formatdate(localtime=True)
+        msg["Message-ID"] = make_msgid(domain=sender_domain)
 
         # MIME-Version
         msg["MIME-Version"] = "1.0"
@@ -154,19 +163,16 @@ class SMTPHandler:
 
         msg.attach(alt_part)
 
-        # ── Resume attachment ─────────────────────────────────
-        if os.path.exists(self.resume_path):
-            with open(self.resume_path, "rb") as f:
-                pdf_data = f.read()
-            resume_name = os.path.basename(self.resume_path)
-            attachment = MIMEApplication(pdf_data, _subtype="pdf")
+        # ── Resume attachment (cached in memory) ──────────────
+        if self._resume_bytes is not None:
+            attachment = MIMEApplication(self._resume_bytes, _subtype="pdf")
             attachment.add_header(
                 "Content-Disposition",
                 "attachment",
-                filename=resume_name
+                filename=self._resume_name
             )
             msg.attach(attachment)
-            print(f"[Mailer] Resume attached: {resume_name}")
+            print(f"[Mailer] Resume attached: {self._resume_name}")
         else:
             print(f"[Mailer] Resume not found at '{self.resume_path}' — sending without attachment")
 
@@ -179,7 +185,7 @@ class SMTPHandler:
         """
         base  = Config.DELAY_BETWEEN_EMAILS
         jitter = random.uniform(-base * 0.2, base * 0.4)
-        delay = max(30, base + jitter)
+        delay = max(15, base + jitter)
         print(f"[Mailer] Waiting {delay:.0f}s before next email...")
         time.sleep(delay)
 
@@ -189,13 +195,14 @@ class SMTPHandler:
     def send_email(self, to_email: str, subject: str, body: str) -> dict:
         """
         Send a single email with proper anti-spam structure.
-        Returns result dict with status and error info.
+        Returns result dict with status, permanent_failure, and error info.
         """
         result = {
-            "email":   to_email,
-            "subject": subject,
-            "status":  "failed",
-            "error":   None,
+            "email":             to_email,
+            "subject":           subject,
+            "status":            "failed",
+            "permanent_failure": False,
+            "error":             None,
         }
 
         # Daily limit guard
@@ -217,12 +224,19 @@ class SMTPHandler:
             print(f"[Mailer] Sent to {to_email} ({self._sent_count}/{Config.MAX_EMAILS_PER_DAY})")
 
         except smtplib.SMTPRecipientsRefused:
+            result["permanent_failure"] = True
             result["error"] = "Recipient refused — likely invalid email"
             print(f"[Mailer] Invalid address: {to_email}")
 
-        except smtplib.SMTPAuthenticationError:
-            result["error"] = "SMTP auth failed — check SMTP_EMAIL and SMTP_PASSWORD in .env"
-            print("[Mailer] SMTP auth failed. Check .env credentials.")
+        except smtplib.SMTPAuthenticationError as e:
+            err_detail = e.smtp_error.decode(errors="ignore") if isinstance(e.smtp_error, bytes) else str(e.smtp_error)
+            result["error"] = f"SMTP auth failed ({e.smtp_code}): {err_detail}"
+            print(f"[Mailer] {result['error']}")
+
+        except smtplib.SMTPResponseException as e:
+            result["permanent_failure"] = e.smtp_code in (550, 551, 553)
+            result["error"] = f"({e.smtp_code}) {e.smtp_error}"
+            print(f"[Mailer] SMTP error for {to_email}: {result['error']}")
 
         except smtplib.SMTPException as e:
             result["error"] = str(e)
@@ -237,10 +251,11 @@ class SMTPHandler:
     # ─────────────────────────────────────────────────────────
     # SEND BATCH
     # ─────────────────────────────────────────────────────────
-    def send_batch(self, email_list: list[dict]) -> list[dict]:
+    def send_batch(self, email_list: list[dict], on_result=None) -> list[dict]:
         """
         Send a batch of emails with human-like random delays.
         Input: list of {email, subject, body, post_url, company}
+        Optional on_result(item, result) callback persists each send immediately.
         Returns: list of result dicts
         """
         results = []
@@ -261,9 +276,15 @@ class SMTPHandler:
             result["company"]  = item.get("company", "")
             results.append(result)
 
-            # Stop if daily limit hit
+            if on_result is not None:
+                try:
+                    on_result(item, result)
+                except Exception as cb_err:
+                    print(f"[Mailer] ⚠️  Result callback error for {item['email']}: {cb_err}")
+
+            # Stop immediately on daily limit or auth failure
             err_msg = result.get("error") or ""
-            if err_msg.startswith("Daily limit"):
+            if err_msg.startswith("Daily limit") or err_msg.startswith("SMTP auth failed"):
                 break
 
             # Human-like delay before next email
@@ -285,8 +306,10 @@ class SMTPHandler:
             server.quit()
             print("[Mailer] SMTP connection OK")
             return True
-        except smtplib.SMTPAuthenticationError:
-            print("[Mailer] SMTP auth failed — check SMTP_EMAIL and SMTP_PASSWORD in .env")
+        except smtplib.SMTPAuthenticationError as e:
+            err_detail = e.smtp_error.decode(errors="ignore") if isinstance(e.smtp_error, bytes) else str(e.smtp_error)
+            print(f"[Mailer] SMTP auth failed ({e.smtp_code}): {err_detail}")
+            print("[Mailer] Tip: Verify 2-Step Verification & Gmail App Password in .env (SMTP_EMAIL / SMTP_PASSWORD).")
             return False
         except Exception as e:
             print(f"[Mailer] SMTP connection failed: {e}")

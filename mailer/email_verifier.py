@@ -8,12 +8,11 @@ Pre-send email validation and verification:
 """
 
 import re
-import socket
 import dns.resolver
 
-# Standard strict email regex — local part must start with letter/digit
+# Standard strict email regex — local part starts & ends with letter/digit (1+ chars)
 EMAIL_REGEX = re.compile(
-    r'^[a-zA-Z0-9][a-zA-Z0-9_.+-]*[a-zA-Z0-9]@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
+    r'^[a-zA-Z0-9](?:[a-zA-Z0-9_.+-]*[a-zA-Z0-9])?@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'
 )
 
 # Disposable email providers / domains to avoid
@@ -24,6 +23,14 @@ DISPOSABLE_DOMAINS = {
     "example.com", "test.com", "sample.com", "domain.com", "fake.com"
 }
 
+# Free/personal email domains (skipped when SKIP_PERSONAL_EMAILS=true)
+PERSONAL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.in", "yahoo.in",
+    "hotmail.com", "outlook.com", "live.com", "msn.com", "icloud.com",
+    "me.com", "aol.com", "protonmail.com", "proton.me", "rediffmail.com",
+    "gmx.com", "yandex.com", "zohomail.in",
+}
+
 # Spam trap / system accounts to avoid
 SYSTEM_USERNAMES = {
     "abuse", "postmaster", "spam", "webmaster", "security",
@@ -32,6 +39,15 @@ SYSTEM_USERNAMES = {
 
 # In-memory cache for verified domains so we don't query DNS repeatedly
 _DOMAIN_MX_CACHE = {}
+
+
+def is_personal_email(email: str) -> bool:
+    """Return True if the email uses a free/personal webmail domain."""
+    clean_email = email.strip().lower()
+    if "@" not in clean_email:
+        return False
+    domain_part = clean_email.split("@", 1)[1]
+    return domain_part in PERSONAL_DOMAINS
 
 
 def check_syntax(email: str) -> bool:

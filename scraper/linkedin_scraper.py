@@ -17,6 +17,12 @@ from playwright.sync_api import Page
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
+from scraper.session_manager import COOKIE_FILE, resilient_goto
+
+
+class SessionInterruptedError(Exception):
+    """Raised when LinkedIn redirects an active scrape to login/checkpoint."""
+    pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -161,177 +167,31 @@ def build_search_url(hashtag_query: str, date_filter: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POST DATA EXTRACTOR
-# ─────────────────────────────────────────────────────────────────────────────
-
-def expand_see_more(page: Page, post_element):
-    """Click 'see more' / '…see more' if present to get full post text"""
-    try:
-        # Try finding buttons/spans that match 'see more'
-        see_more_selectors = [
-            "button.feed-shared-inline-show-more-text__see-more-less-toggle",
-            "button[aria-label*='see more' i]",
-            "button:has-text('see more')",
-            "span:has-text('…see more')",
-            "span:has-text('see more')",
-            ".see-more",
-            "button[data-tracking-control-name*='see_more']",
-        ]
-        for sel in see_more_selectors:
-            btn = post_element.query_selector(sel)
-            if btn:
-                try:
-                    btn.scroll_into_view_if_needed(timeout=2000)
-                    btn.click(timeout=2000)
-                    human_pause(0.5, 1.0)
-                    return
-                except Exception:
-                    # Fallback to direct JS click
-                    try:
-                        post_element.evaluate(f"""(el) => {{
-                            const b = el.querySelector("{sel}");
-                            if (b) b.click();
-                        }}""")
-                        human_pause(0.4, 0.8)
-                        return
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-
-def extract_post_data(page: Page, post_element) -> dict | None:
-    """Extract all data from a single post element"""
-    try:
-        data = {
-            "post_text": "",
-            "poster_name": "",
-            "poster_profile_url": "",
-            "company": "",
-            "post_url": "",
-            "hashtags": [],
-            "scraped_at": datetime.utcnow().isoformat(),
-        }
-
-        # ── Hover over post first (human behaviour) ───────────
-        human_hover_post(page, post_element)
-
-        # ── Expand 'see more' to get full text ────────────────
-        expand_see_more(page, post_element)
-
-        # ── Post text ─────────────────────────────────────────
-        for selector in [
-            "[data-test-id='main-feed-activity-card__commentary']",
-            ".feed-shared-update-v2__description",
-            ".update-components-text",
-            ".feed-shared-inline-show-more-text",
-            ".feed-shared-text",
-            ".break-words",
-            "div.update-components-update-v2__commentary",
-            "span[dir='ltr']",
-        ]:
-            try:
-                el = post_element.query_selector(selector)
-                if el:
-                    text_val = el.inner_text().strip()
-                    # Filter out video player accessibility overlays
-                    if len(text_val) > 15 and "subtitles" not in text_val.lower() and "descriptions off" not in text_val.lower():
-                        data["post_text"] = text_val
-                        break
-            except Exception:
-                continue
-
-        if not data["post_text"]:
-            # Fallback: get entire text of element if it has sufficient content
-            try:
-                raw_text = post_element.inner_text().strip()
-                if len(raw_text) > 20:
-                    lines = [line.strip() for line in raw_text.split("\n") if line.strip() and not any(skip in line.lower() for skip in ["subtitles", "descriptions off", "dialog", "playback"])]
-                    cleaned = " ".join(lines)
-                    if len(cleaned) > 15:
-                        data["post_text"] = cleaned
-            except Exception:
-                pass
-
-        if not data["post_text"] or len(data["post_text"]) < 8:
-            return None
-
-        # ── Poster name ───────────────────────────────────────
-        for selector in [
-            ".update-components-actor__name",
-            ".feed-shared-actor__name",
-            ".app-aware-link span[aria-hidden='true']",
-            "a[href*='/in/']",
-        ]:
-            try:
-                el = post_element.query_selector(selector)
-                if el:
-                    name_candidate = el.inner_text().strip()
-                    if name_candidate and len(name_candidate) < 60:
-                        data["poster_name"] = name_candidate
-                        break
-            except Exception:
-                continue
-
-        # ── Poster profile URL ────────────────────────────────
-        for selector in [
-            ".update-components-actor__meta a",
-            ".feed-shared-actor__container a",
-        ]:
-            try:
-                el = post_element.query_selector(selector)
-                if el:
-                    href = el.get_attribute("href")
-                    if href and "/in/" in href:
-                        data["poster_profile_url"] = href.split("?")[0]
-                        break
-            except Exception:
-                continue
-
-        # ── Company / subtitle ────────────────────────────────
-        for selector in [
-            ".update-components-actor__description",
-            ".feed-shared-actor__description",
-        ]:
-            try:
-                el = post_element.query_selector(selector)
-                if el:
-                    data["company"] = el.inner_text().strip()[:100]
-                    break
-            except Exception:
-                continue
-
-        # ── Post URL ──────────────────────────────────────────
-        for selector in [
-            "a.app-aware-link[href*='/posts/']",
-            "a[href*='ugcPost']",
-            "a[href*='/feed/update/']",
-        ]:
-            try:
-                el = post_element.query_selector(selector)
-                if el:
-                    href = el.get_attribute("href")
-                    if href:
-                        data["post_url"] = href.split("?")[0]
-                        break
-            except Exception:
-                continue
-
-        # ── Hashtags from text ────────────────────────────────
-        data["hashtags"] = re.findall(r"#\w+", data["post_text"])
-
-        return data
-
-    except Exception as e:
-        print(f"[Scraper] ⚠️  Post extraction error: {e}")
-        return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # MAIN SCRAPER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _navigate_like_human(page: Page, url: str):
+_NOISE_LINES = {
+    "like", "comment", "repost", "send", "follow", "+ follow",
+    "copy", "more", "feed post", "activate to view larger image,",
+}
+_NOISE_SUBSTRINGS = ("subtitles", "descriptions off", "dialog", "playback", "feed post")
+
+
+def _clean_post_text(raw_text: str) -> str:
+    """Strip LinkedIn UI chrome and accessibility noise from extracted post text."""
+    lines = []
+    for line in raw_text.split("\n"):
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        low = cleaned.lower()
+        if low in _NOISE_LINES or any(skip in low for skip in _NOISE_SUBSTRINGS):
+            continue
+        lines.append(cleaned)
+    return "\n".join(lines)
+
+
+def _navigate_like_human(page: Page, url: str) -> bool:
     """
     Navigate to URL with human-like pre/post behaviour.
     Avoids robotic instant navigation pattern.
@@ -341,14 +201,16 @@ def _navigate_like_human(page: Page, url: str):
         human_mouse_move(page)
         human_pause(0.3, 0.8)
 
-    page.goto(url, timeout=30000, wait_until="domcontentloaded")
+    if not resilient_goto(page, url, timeout_ms=45000):
+        return False
 
     # Simulate page load reading time
-    human_pause(2.5, 5.0)
+    human_pause(2.5, 4.5)
 
     # Initial mouse movement after page load
     human_mouse_move(page)
-    human_pause(1.0, 2.5)
+    human_pause(0.8, 1.8)
+    return True
 
 
 def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
@@ -361,26 +223,51 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
 
     print(f"\n[Scraper] 🔍 Search Query: '{hashtag_query}' | Last {Config.LINKEDIN_SCRAPE_DAYS} days")
 
-    _navigate_like_human(page, url)
+    if not _navigate_like_human(page, url):
+        print(f"[Scraper] ⚠️  Timed out loading search page for '{hashtag_query}' — skipping query.")
+        return []
+
+    if any(p in page.url for p in ["/login", "/authwall", "/checkpoint", "/challenge"]):
+        raise SessionInterruptedError(f"LinkedIn redirected to {page.url[:80]}")
+
+    # Wait briefly for LinkedIn SPA search cards or 'no results' state to render
+    try:
+        page.wait_for_selector(
+            "button[aria-label*='eaction'], button[aria-label*='ike'], .search-no-results__image",
+            timeout=10000,
+        )
+    except Exception:
+        pass
 
     posts_data    = []
     seen_keys     = set()
     scroll_count  = 0
     max_scrolls   = (Config.MAX_POSTS_PER_SEARCH // 5) + 8
     no_new_streak = 0
+    pause_base    = max(1.0, Config.SCROLL_PAUSE_TIME)
 
     while len(posts_data) < Config.MAX_POSTS_PER_SEARCH and scroll_count < max_scrolls:
 
-        # ── 1. Automatically click all '...more' buttons on screen ───────
+        if any(p in page.url for p in ["/login", "/authwall", "/checkpoint", "/challenge"]):
+            raise SessionInterruptedError(f"LinkedIn redirected mid-scroll to {page.url[:80]}")
+
+        # ── 1. Expand truncated post text ('...see more' toggles only) ─
         try:
             page.evaluate("""() => {
-                const moreButtons = Array.from(document.querySelectorAll("button, span"))
-                    .filter(b => b.innerText && (b.innerText.toLowerCase().includes("more") || b.innerText.includes("…")));
-                moreButtons.forEach(btn => {
+                const toggles = new Set([
+                    ...document.querySelectorAll(
+                        "button.feed-shared-inline-show-more-text__see-more-less-toggle, button[aria-label*='see more' i]"
+                    ),
+                    ...Array.from(document.querySelectorAll("button, span")).filter(el => {
+                        const txt = (el.innerText || "").trim().toLowerCase();
+                        return txt.length > 0 && txt.length <= 20 && /^(?:(?:…|\\.{3})\\s*(?:see\\s+)?more|see\\s+more)$/.test(txt);
+                    })
+                ]);
+                toggles.forEach(btn => {
                     try { btn.click(); } catch(e) {}
                 });
             }""")
-            human_pause(0.5, 1.0)
+            human_pause(0.4, 0.8)
         except Exception:
             pass
 
@@ -401,9 +288,11 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
                     let p = btn;
                     for (let i = 0; i < 20; i++) {
                         if (!p || !p.parentElement || p.parentElement.tagName === "BODY" || p.parentElement.id === "root") break;
+                        if (p.matches && p.matches("[data-urn*='urn:li:activity:'], [data-id*='urn:li:activity:'], [data-urn*='urn:li:ugcPost:']")) break;
+                        const parentUrns = p.parentElement.querySelectorAll("[data-urn*='urn:li:activity:'], [data-urn*='urn:li:ugcPost:']").length;
                         const countLikes = p.parentElement.querySelectorAll("button[aria-label*='eaction'], button[aria-label*='ike']").length;
                         const txt = p.parentElement.innerText || "";
-                        if (countLikes > 8 || txt.length > 5000) break;
+                        if (parentUrns > 1 || countLikes > 8 || txt.length > 5000) break;
                         p = p.parentElement;
                     }
                     if (!p || seenCards.has(p)) return;
@@ -418,15 +307,56 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
                         name = rawText.split("•")[0].split(String.fromCharCode(10))[0].trim() || "Recruiter";
                     }
 
-                    // Extract post link
+                    // Extract poster subtitle / company snippet
+                    let company = "";
+                    const actorDesc = p.querySelector(
+                        ".update-components-actor__description, .feed-shared-actor__description, .update-components-actor__sub-description"
+                    );
+                    if (actorDesc && actorDesc.innerText) {
+                        company = actorDesc.innerText.split(String.fromCharCode(10))[0].trim().slice(0, 100);
+                    }
+
+                    // Extract post link or URN fallback
+                    let postUrl = "";
                     const postLink = p.querySelector("a[href*='/feed/update/'], a[href*='/posts/'], a[href*='activity:'], a[href*='/jobs/view/']");
-                    const postUrl = postLink ? postLink.href.split("?")[0] : "";
+                    if (postLink && postLink.href) {
+                        postUrl = postLink.href.split("?")[0];
+                    } else {
+                        const urnHolder = p.closest("[data-urn*='urn:li:'], [data-id*='urn:li:']") ||
+                                          p.querySelector("[data-urn*='urn:li:'], [data-id*='urn:li:']");
+                        if (urnHolder) {
+                            const urn = urnHolder.getAttribute("data-urn") || urnHolder.getAttribute("data-id") || "";
+                            const m = urn.match(/urn:li:(?:activity|ugcPost):\d+/);
+                            if (m) postUrl = `https://www.linkedin.com/feed/update/${m[0]}/`;
+                        }
+                    }
+
+                    // Prefer dedicated post commentary container over full card chrome
+                    let postText = "";
+                    const commentarySelectors = [
+                        "[data-test-id='main-feed-activity-card__commentary']",
+                        ".feed-shared-update-v2__description",
+                        ".update-components-text",
+                        ".feed-shared-inline-show-more-text",
+                        "div.update-components-update-v2__commentary",
+                    ];
+                    for (const sel of commentarySelectors) {
+                        const el = p.querySelector(sel);
+                        if (el && el.innerText && el.innerText.trim().length >= 20) {
+                            postText = el.innerText.trim();
+                            break;
+                        }
+                    }
+                    if (!postText) {
+                        postText = p.innerText || "";
+                    }
 
                     uniqueCards.push({
                         name: name,
                         profile_url: nameLink ? nameLink.href.split("?")[0] : "",
+                        company: company,
                         post_url: postUrl,
-                        text: p.innerText || ""
+                        text: postText
                     });
                 });
 
@@ -443,14 +373,9 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
             if not raw_text or len(raw_text) < 15:
                 continue
 
-            # Remove navigation/accessibility noise from text
-            lines = [
-                line.strip() for line in raw_text.split("\n")
-                if line.strip() and not any(skip in line.lower() for skip in [
-                    "subtitles", "descriptions off", "dialog", "playback", "feed post"
-                ])
-            ]
-            clean_text = "\n".join(lines)
+            clean_text = _clean_post_text(raw_text)
+            if len(clean_text) < 15:
+                continue
 
             # Deduplication key
             key = raw_item.get("post_url") or clean_text[:100]
@@ -462,7 +387,7 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
                 "post_text": clean_text,
                 "poster_name": raw_item.get("name") or "Recruiter",
                 "poster_profile_url": raw_item.get("profile_url") or "",
-                "company": "",
+                "company": raw_item.get("company") or "",
                 "post_url": raw_item.get("post_url") or "",
                 "hashtags": re.findall(r"#\w+", clean_text),
                 "scraped_at": datetime.utcnow().isoformat(),
@@ -491,15 +416,13 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
             print("[Scraper] LinkedIn says: no more results.")
             break
 
-        # ── Human-like scroll down with wait ───────────────────
+        # ── Human-like scroll down with configured pause ──────
         print("[Scraper] ⏳ Scrolling down to load more posts...")
         human_scroll(page, direction="down", intensity="normal")
-        page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 1.5))")
 
-        wait_time = random.uniform(3.0, 5.0)
-        time.sleep(wait_time)
+        time.sleep(random.uniform(pause_base * 0.8, pause_base * 1.4))
 
-        if random.random() < 0.3:
+        if random.random() < 0.25:
             random_idle_behaviour(page)
 
         scroll_count += 1
@@ -510,14 +433,34 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
 
 def run_scraper(page: Page) -> list[dict]:
     """
-    Master scraper: iterates all configured hashtags.
+    Master scraper: iterates all unique configured search queries.
     Returns globally deduplicated list of all posts.
     """
     all_posts = []
     all_keys  = set()
 
-    for i, hashtag_query in enumerate(Config.LINKEDIN_HASHTAGS):
-        posts = scrape_posts_for_hashtag(page, hashtag_query)
+    # Deduplicate search queries while preserving order
+    unique_queries = []
+    seen_queries = set()
+    for q in Config.LINKEDIN_HASHTAGS:
+        q_norm = q.strip()
+        if q_norm and q_norm.lower() not in seen_queries:
+            seen_queries.add(q_norm.lower())
+            unique_queries.append(q_norm)
+
+    for i, hashtag_query in enumerate(unique_queries):
+        try:
+            posts = scrape_posts_for_hashtag(page, hashtag_query)
+        except SessionInterruptedError as e:
+            print(f"\n[Scraper] 🛑 LinkedIn session interrupted ({e})")
+            print("[Scraper]    Stopping further queries cleanly instead of looping on a logged-out browser.")
+            if os.path.exists(COOKIE_FILE):
+                try:
+                    os.remove(COOKIE_FILE)
+                    print("[Scraper]    Removed expired cookies.json — next run will re-authenticate.")
+                except OSError:
+                    pass
+            break
 
         for post in posts:
             key = post.get("post_url") or post["post_text"][:100]
@@ -526,14 +469,11 @@ def run_scraper(page: Page) -> list[dict]:
                 all_posts.append(post)
 
         # Human-like gap between different searches
-        if i < len(Config.LINKEDIN_HASHTAGS) - 1:
-            gap = random.uniform(8.0, 18.0)
-            print(f"\n[Scraper] ⏳ Waiting {gap:.1f}s before next hashtag (human behaviour)...")
-            # Simulate browsing during wait — small random scrolls
-            for _ in range(random.randint(1, 3)):
-                human_scroll(page, intensity="slow")
-                human_pause(1.0, 3.0)
-            remaining = gap - 5
+        if i < len(unique_queries) - 1:
+            gap = random.uniform(6.0, 14.0)
+            print(f"\n[Scraper] ⏳ Waiting {gap:.1f}s before next search query (human behaviour)...")
+            human_scroll(page, intensity="slow")
+            remaining = gap - 2.0
             if remaining > 0:
                 time.sleep(remaining)
 

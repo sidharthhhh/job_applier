@@ -6,12 +6,12 @@ Extracts email addresses from LinkedIn post text using Regex
 import re
 
 
-# Standard email regex pattern — local part MUST start and end with an alphanumeric character
+# Standard email regex pattern — local part starts & ends with alphanumeric (1+ chars)
 EMAIL_REGEX = re.compile(
     r"""
     (?<![/@\w])
     (
-        [a-zA-Z0-9][a-zA-Z0-9._%+\-]*[a-zA-Z0-9]
+        [a-zA-Z0-9](?:[a-zA-Z0-9._%+\-]*[a-zA-Z0-9])?
         @
         [a-zA-Z0-9.\-]+
         \.
@@ -22,13 +22,15 @@ EMAIL_REGEX = re.compile(
     re.VERBOSE | re.IGNORECASE
 )
 
-# Obfuscated pattern: name [at] domain [dot] com or name(at)domain.com
+# Obfuscated pattern: name [at] domain [dot] com or name(at)domain.com (single-line)
 OBFUSCATED_REGEX = re.compile(
-    r'([a-zA-Z0-9._%+\-]+)\s*(?:@|\[at\]|\(at\))\s*([a-zA-Z0-9.\-]+)\s*(?:\.|\[dot\]|\(dot\))\s*([a-zA-Z]{2,})',
+    r'\b([a-zA-Z0-9._%+\-]+)[ \t]*(?:@|\[at\]|\(at\))[ \t]*'
+    r'([a-zA-Z0-9\-]+(?:[ \t]*(?:\.|\[dot\]|\(dot\))[ \t]*[a-zA-Z0-9\-]+)*)'
+    r'[ \t]*(?:\.|\[dot\]|\(dot\))[ \t]*([a-zA-Z]{2,})\b',
     re.IGNORECASE
 )
 
-# Common spam/placeholder emails to ignore
+# Common spam/placeholder emails and image/file extensions to ignore
 IGNORED_EMAILS = {
     "example@gmail.com",
     "test@test.com",
@@ -36,6 +38,10 @@ IGNORED_EMAILS = {
     "noreply@linkedin.com",
     "no-reply@linkedin.com",
     "jobs@linkedin.com",
+}
+
+IGNORED_TLDS = {
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "css", "js", "html", "htm"
 }
 
 
@@ -53,7 +59,8 @@ def extract_emails(text: str) -> list[str]:
     # Find obfuscated emails (e.g. hr [at] company [dot] com)
     obf_matches = OBFUSCATED_REGEX.findall(text)
     for user, domain, tld in obf_matches:
-        assembled = f"{user}@{domain}.{tld}".lower()
+        clean_domain = re.sub(r'[ \t]*(?:\.|\[dot\]|\(dot\))[ \t]*', '.', domain)
+        assembled = f"{user}@{clean_domain}.{tld}".lower()
         found.append(assembled)
 
     # Clean, lowercase, deduplicate, filter ignored
@@ -61,11 +68,17 @@ def extract_emails(text: str) -> list[str]:
     seen = set()
     for email in found:
         email = email.lower().strip().strip(".-_:")
-        if "@" in email:
-            user_part, domain_part = email.split("@", 1)
-            user_part = user_part.strip(".-_:")
-            domain_part = domain_part.strip(".-_:")
-            email = f"{user_part}@{domain_part}"
+        if "@" not in email:
+            continue
+        user_part, domain_part = email.split("@", 1)
+        user_part = user_part.strip(".-_:")
+        domain_part = domain_part.strip(".-_:")
+        if not user_part or "." not in domain_part:
+            continue
+        tld = domain_part.rsplit(".", 1)[-1]
+        if tld in IGNORED_TLDS:
+            continue
+        email = f"{user_part}@{domain_part}"
         if len(email) > 5 and email not in seen and email not in IGNORED_EMAILS:
             seen.add(email)
             emails.append(email)
@@ -91,8 +104,9 @@ def extract_emails_from_posts(posts: list[dict]) -> list[dict]:
                 email_records.append({
                     "email": email,
                     "post_url": post.get("post_url", ""),
-                    "post_text": text[:500],   # Store first 500 chars for context
+                    "post_text": text[:1200],   # Preserve full context up to Ollama prompt limit
                     "poster_name": post.get("poster_name", ""),
+                    "poster_profile_url": post.get("poster_profile_url", ""),
                     "company": post.get("company", ""),
                     "hashtags": post.get("hashtags", []),
                 })
