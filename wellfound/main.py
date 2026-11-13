@@ -17,7 +17,7 @@ Usage:
 import sys
 import time
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Ensure UTF-8 output to prevent Windows cp1252 charmap encoding errors
@@ -182,11 +182,11 @@ def run_pipeline():
             skipped += 1
 
     # Check already-applied status for clarity
-    applied_cutoff = datetime.utcnow() - timedelta(days=Config.APPLY_COOLDOWN_DAYS)
+    applied_cutoff = datetime.now(timezone.utc) - timedelta(days=Config.APPLY_COOLDOWN_DAYS)
     already_applied_ids = set(
         d["job_id"] for d in db.applied.find(
             {
-                "status": {"$in": ["applied", "already_applied", "external_ats"]},
+                "status": {"$in": ["applied", "already_applied", "external_ats", "closed", "ineligible"]},
                 "applied_at": {"$gte": applied_cutoff}
             },
             {"job_id": 1}
@@ -197,7 +197,7 @@ def run_pipeline():
     pending_new  = len(relevant) - already_done
 
     print(f"[Filter] 🎯 {len(relevant)} jobs match your profile keywords ({skipped} skipped)")
-    print(f"[Filter] 📊 Breakdown: {already_done} already applied | {pending_new} pending new application")
+    print(f"[Filter] 📊 Breakdown: {already_done} already handled | {pending_new} pending new application")
 
     # ── STEP 3: Auto-Apply (native Wellfound) ────────────────
     if Config.AUTO_APPLY and relevant:
@@ -211,7 +211,7 @@ def run_pipeline():
             playwright2, browser2, context2, page2 = get_authenticated_browser(
                 Config.EMAIL, Config.PASSWORD, Config.HEADLESS
             )
-            applied_count, external_count = 0, 0
+            applied_count, external_count, ineligible_count = 0, 0, 0
             try:
                 for i, job in enumerate(pending, 1):
                     try:
@@ -224,6 +224,9 @@ def run_pipeline():
                             Config.YOUR_SKILLS, Config.YOUR_EXPERIENCE,
                             Config.OLLAMA_BASE_URL, Config.OLLAMA_MODEL,
                             Config.APPLY_NOTE_MAX_WORDS,
+                            your_mobile=Config.YOUR_MOBILE,
+                            your_linkedin=Config.YOUR_LINKEDIN,
+                            your_github=Config.YOUR_GITHUB,
                         )
                         db.save_application(result)
 
@@ -233,8 +236,13 @@ def run_pipeline():
                         elif result["status"] == "external_ats":
                             print(f"[Apply] 🔗 External ATS → {result['message'][:80]}")
                             external_count += 1
+                        elif result["status"] == "ineligible":
+                            print(f"[Apply] 🚫 Ineligible — {result['message'][:80]}")
+                            ineligible_count += 1
                         elif result["status"] == "already_applied":
                             print(f"[Apply] ⏭️  Already applied — skipping")
+                        elif result["status"] == "closed":
+                            print(f"[Apply] 🔒 Job Closed — {result['message']}")
                         else:
                             print(f"[Apply] ❌ Failed: {result['message']}")
 
@@ -248,7 +256,7 @@ def run_pipeline():
                 browser2.close()
                 playwright2.stop()
 
-            print(f"\n[Apply] 🏁 Applied: {applied_count} | External ATS: {external_count}")
+            print(f"\n[Apply] 🏁 Applied: {applied_count} | External ATS: {external_count} | Ineligible: {ineligible_count}")
         else:
             print("[Apply] ✅ All relevant jobs already applied or on cooldown!")
     elif not Config.AUTO_APPLY:
