@@ -5,14 +5,16 @@
 *.env
 
 # ─── LinkedIn Session & Sensitive Auth ──────────────────────
-session/
-!session/.gitkeep
-session/cookies.json
+/session/
+!/session/.gitkeep
+/session/cookies.json
 *.session
 
 # ─── Wellfound Session & Cookies ─────────────────────────────
-wellfound/session/
+wellfound/session/*
 !wellfound/session/.gitkeep
+!wellfound/session/__init__.py
+!wellfound/session/session_manager.py
 wellfound/session/wf_cookies.json
 *cookies.json
 *.cookies
