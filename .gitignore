@@ -1,17 +1,37 @@
-# ─── Secrets & Environment ──────────────────────────────────
+# ─── Secrets & Environment Variables ─────────────────────────
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
 *.env
 
 # ─── LinkedIn Session & Sensitive Auth ──────────────────────
 session/
+!session/.gitkeep
 session/cookies.json
 *.session
 
+# ─── Wellfound Session & Cookies ─────────────────────────────
+wellfound/session/
+!wellfound/session/.gitkeep
+wellfound/session/wf_cookies.json
+*cookies.json
+*.cookies
+
+# ─── Scraper Debug Dumps & Output ────────────────────────────
+wellfound/tools/debug_output/
+debug_output/
+*/debug_output/
+*.png
+*.jpg
+*.jpeg
+*.html
+
 # ─── Personal Documents & Resumes ───────────────────────────
-assets/*.pdf
+*.pdf
+*.docx
+*.doc
 !assets/.gitkeep
+!assets/README.txt
 
 # ─── Python Virtual Environment & Bytecode ──────────────────
 venv/
@@ -19,6 +39,8 @@ venv/
 env/
 ENV/
 __pycache__/
+*/__pycache__/
+*/*/__pycache__/
 *.py[cod]
 *$py.class
 *.so
