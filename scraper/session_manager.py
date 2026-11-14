@@ -61,34 +61,36 @@ Object.defineProperty(navigator, 'webdriver', {
 
 
 def ensure_session_dir():
-    os.makedirs(SESSION_DIR, exist_ok=True)
+    os.makedirs(Config.get_session_dir(), exist_ok=True)
 
 
 def save_cookies(context: BrowserContext):
-    """Save browser cookies to file"""
+    """Save browser cookies to profile-scoped cookie file"""
     ensure_session_dir()
+    cookie_file = Config.get_cookie_file()
     cookies = context.cookies()
-    with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+    with open(cookie_file, "w", encoding="utf-8") as f:
         json.dump(cookies, f, indent=2)
-    print(f"[Session] ✅ Cookies saved → {COOKIE_FILE}")
+    print(f"[Session] ✅ Cookies saved → {cookie_file}")
 
 
 def load_cookies(context: BrowserContext) -> bool:
-    """Load cookies from file. Returns True if loaded."""
-    if not os.path.exists(COOKIE_FILE):
+    """Load cookies from profile-scoped file. Returns True if loaded."""
+    cookie_file = Config.get_cookie_file()
+    if not os.path.exists(cookie_file):
         return False
     try:
-        with open(COOKIE_FILE, "r", encoding="utf-8") as f:
+        with open(cookie_file, "r", encoding="utf-8") as f:
             cookies = json.load(f)
         if not isinstance(cookies, list) or not cookies:
             return False
         context.add_cookies(cookies)
-        print("[Session] ✅ Cookies loaded from saved session")
+        print(f"[Session] ✅ Cookies loaded from saved session ({Config.PROFILE_NAME})")
         return True
     except Exception as e:
         print(f"[Session] ⚠️  Failed to load saved cookies ({e}) — removing stale file")
         try:
-            os.remove(COOKIE_FILE)
+            os.remove(cookie_file)
         except OSError:
             pass
         return False
@@ -125,12 +127,13 @@ def resilient_goto(page: Page, url: str, timeout_ms: int = 45000, retries: int =
 
 def _build_persistent_context(playwright, headless: bool = False):
     """
-    Launch a persistent Chrome profile in session/chrome_profile.
+    Launch a persistent Chrome profile in session/<profile>/chrome_profile.
     Preserves localStorage, IndexedDB, service workers, and device tokens
     across runs so LinkedIn does not treat each run as a new device.
     """
     ensure_session_dir()
-    os.makedirs(PROFILE_DIR, exist_ok=True)
+    profile_dir = Config.get_chrome_profile_dir()
+    os.makedirs(profile_dir, exist_ok=True)
 
     common_args = [
         "--disable-blink-features=AutomationControlled",
@@ -142,7 +145,7 @@ def _build_persistent_context(playwright, headless: bool = False):
         common_args.append("--start-maximized")
 
     launch_kwargs = {
-        "user_data_dir": PROFILE_DIR,
+        "user_data_dir": profile_dir,
         "headless": headless,
         "args": common_args,
         "viewport": {"width": 1440, "height": 900},
@@ -244,19 +247,33 @@ def manual_login(page: Page, context: BrowserContext):
     print("[Session] (Waiting — do NOT press anything here yet)\n")
 
     # ── Simple polling loop — no threading ────────────────────
-    LOGGED_IN_PATTERNS = ["/feed", "/mynetwork", "/home", "/checkpoint",
-                          "/challenge", "/uas/oauth"]
+    # Track initial li_at cookie value so we only trigger on a NEW login/signup cookie
+    initial_li_at = {
+        c.get("value")
+        for c in context.cookies("https://www.linkedin.com")
+        if c.get("name") == "li_at" and c.get("value")
+    }
     max_wait = 300    # 5 minutes
     interval = 2
     elapsed  = 0
     last_url = ""
+    active_page = page
 
     while elapsed < max_wait:
         time.sleep(interval)
         elapsed += interval
 
         try:
-            current_url = page.url
+            pages = [p for p in context.pages if not p.is_closed()]
+            if not pages:
+                break
+            # Prefer a tab that has navigated away from /login
+            active_page = next(
+                (p for p in pages if "/login" not in (p.url or "")),
+                pages[0],
+            )
+            urls = [p.url or "" for p in pages]
+            current_url = active_page.url or ""
         except Exception:
             # Page closed or crashed
             break
@@ -266,27 +283,44 @@ def manual_login(page: Page, context: BrowserContext):
             print(f"[Session] URL changed → {current_url[:80]}")
             last_url = current_url
 
-        # Check if logged in (on feed or any post-login page)
-        if any(p in current_url for p in LOGGED_IN_PATTERNS):
-            # Handle checkpoint / OTP pages
-            if "/checkpoint" in current_url or "/challenge" in current_url:
-                print("\n[Session] ⚠️  LinkedIn needs verification/OTP.")
-                print("[Session]    Complete it in the browser window.")
-                print("[Session]    Press ENTER here AFTER you see the LinkedIn feed.\n")
-                input("[Session] ▶ Press ENTER when on LinkedIn feed → ")
-                _human_pause(2, 3)
-                current_url = page.url
+        # Handle checkpoint / OTP / post-signup onboarding pages across any open tab
+        if any("/checkpoint" in u or "/challenge" in u or "/onboarding" in u for u in urls):
+            print("\n[Session] ⚠️  LinkedIn needs verification/OTP or signup onboarding.")
+            print("[Session]    Complete it in the browser window.")
+            print("[Session]    Press ENTER here AFTER you see your LinkedIn feed.\n")
+            input("[Session] ▶ Press ENTER when on LinkedIn feed → ")
+            _human_pause(2, 3)
+            pages = [p for p in context.pages if not p.is_closed()]
+            active_page = next((p for p in pages if _is_on_feed(p.url or "")), pages[0])
+            current_url = active_page.url or ""
 
-            if any(p in current_url for p in ["/feed", "/mynetwork", "/home"]):
-                print(f"\n[Session] ✅ Login detected!")
-                _human_pause(1, 2)
+        # Check if any tab reached LinkedIn feed/home/network
+        feed_page = next((p for p in context.pages if not p.is_closed() and _is_on_feed(p.url or "")), None)
+        if feed_page is not None:
+            print(f"\n[Session] ✅ Login detected!")
+            _human_pause(1, 2)
+            save_cookies(context)
+            print("[Session] ✅ Session saved — future runs are fully automatic!")
+            return
+
+        # Fallback: detect a brand-new li_at cookie (e.g. Google OAuth popup or another tab)
+        current_li_at = {
+            c.get("value")
+            for c in context.cookies("https://www.linkedin.com")
+            if c.get("name") == "li_at" and c.get("value")
+        }
+        if current_li_at - initial_li_at:
+            print("\n[Session] ✅ New LinkedIn session cookie detected — verifying feed...")
+            resilient_goto(active_page, "https://www.linkedin.com/feed/", timeout_ms=30000)
+            _human_pause(1, 2)
+            if _is_on_feed(active_page.url or ""):
                 save_cookies(context)
                 print("[Session] ✅ Session saved — future runs are fully automatic!")
                 return
 
         # Show progress dot every 10 seconds
         if elapsed % 10 == 0:
-            print(f"[Session] Still waiting... {elapsed}s | Current URL: {page.url[:60]}")
+            print(f"[Session] Still waiting... {elapsed}s | Current URL: {current_url[:60]}")
 
     # ── Timeout fallback — ask user to confirm manually ───────
     print("\n[Session] Auto-detect timed out after 5 minutes.")
@@ -297,10 +331,10 @@ def manual_login(page: Page, context: BrowserContext):
     _human_pause(1, 2)
 
     # Navigate to feed explicitly to verify
-    resilient_goto(page, "https://www.linkedin.com/feed/", timeout_ms=30000)
+    resilient_goto(active_page, "https://www.linkedin.com/feed/", timeout_ms=30000)
     _human_pause(2, 3)
 
-    if any(p in page.url for p in ["/feed", "/mynetwork", "/home"]):
+    if _is_on_feed(active_page.url or ""):
         save_cookies(context)
         print("[Session] ✅ Session saved!")
         return
@@ -332,9 +366,10 @@ def get_authenticated_browser():
         active_context = context
 
         # Seed persistent profile with cookies.json before first request if li_at isn't present yet
+        cookie_file = Config.get_cookie_file()
         existing_cookies = context.cookies("https://www.linkedin.com")
         has_li_at = any(c.get("name") == "li_at" for c in existing_cookies)
-        if not has_li_at and os.path.exists(COOKIE_FILE):
+        if not has_li_at and os.path.exists(cookie_file):
             print("[Session] Seeding persistent profile from cookies.json...")
             load_cookies(context)
 
@@ -361,10 +396,10 @@ def get_authenticated_browser():
                 return playwright, context, context, page
 
         # Session genuinely expired / logged out
-        if os.path.exists(COOKIE_FILE):
+        if os.path.exists(cookie_file):
             print(f"[Session] ⚠️  Saved session expired ({page.url[:60]}). Re-login required...")
             try:
-                os.remove(COOKIE_FILE)
+                os.remove(cookie_file)
             except OSError:
                 pass
 

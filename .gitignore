@@ -3,12 +3,15 @@
 .env.local
 .env.*.local
 *.env
+profiles/*
+!profiles/_template/
+!profiles/_template/**
 
 # ─── LinkedIn Session & Sensitive Auth ──────────────────────
 session/
 session/cookies.json
 *.session
-
+a.jpeg
 # ─── Personal Documents & Resumes ───────────────────────────
 assets/*.pdf
 !assets/.gitkeep

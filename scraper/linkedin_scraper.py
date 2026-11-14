@@ -17,7 +17,7 @@ from playwright.sync_api import Page
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
-from scraper.session_manager import COOKIE_FILE, resilient_goto
+from scraper.session_manager import resilient_goto
 
 
 class SessionInterruptedError(Exception):
@@ -147,17 +147,17 @@ def random_idle_behaviour(page: Page):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_search_url(hashtag_query: str, date_filter: str) -> str:
-    """Build LinkedIn content search URL for given hashtags and date filter"""
+    """Build LinkedIn content search URL for given query and date filter."""
     filter_map = {
         "past-week":    '["past-week"]',
         "past-2-weeks": '["past-2-weeks"]',
         "past-month":   '["past-month"]',
     }
-    date_param      = filter_map.get(date_filter, '["past-week"]')
+    date_param = filter_map.get(date_filter, '["past-week"]')
     encoded_keywords = urllib.parse.quote(hashtag_query.strip())
-    encoded_date    = urllib.parse.quote(date_param)
+    encoded_date = urllib.parse.quote(date_param)
 
-    # Use standard search results URL
+    # Use standard search results URL (exact schema that returned 246 posts)
     return (
         f"https://www.linkedin.com/search/results/content/"
         f"?keywords={encoded_keywords}"
@@ -251,6 +251,33 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
         if any(p in page.url for p in ["/login", "/authwall", "/checkpoint", "/challenge"]):
             raise SessionInterruptedError(f"LinkedIn redirected mid-scroll to {page.url[:80]}")
 
+        # ── Diagnostic check on first scroll ──────────────────────────────
+        if scroll_count == 0:
+            try:
+                debug_info = page.evaluate("""() => {
+                    const btnCount = document.querySelectorAll("button").length;
+                    const urnCount = document.querySelectorAll("[data-urn*='urn:li:']").length;
+                    const searchResults = document.querySelectorAll("li.reusable-search__result-container, div.reusable-search__result-container").length;
+                    const feedCards = document.querySelectorAll("div.feed-shared-update-v2, div[data-view-name*='feed-full-update']").length;
+                    const noResults = document.querySelectorAll(".search-no-results__image, .search-reusable-search-no-results").length;
+                    return {
+                        title: document.title || "",
+                        url: window.location.href || "",
+                        btnCount,
+                        urnCount,
+                        searchResults,
+                        feedCards,
+                        noResults,
+                        bodyPreview: (document.body.innerText || "").slice(0, 200).replace(/\\s+/g, " ")
+                    };
+                }""")
+                if isinstance(debug_info, dict):
+                    print(f"[Scraper Debug] Search page: '{debug_info.get('title', '')}' | ResultCards: {debug_info.get('searchResults', 0)} | FeedCards: {debug_info.get('feedCards', 0)} | Buttons: {debug_info.get('btnCount', 0)} | NoResults: {debug_info.get('noResults', 0)}")
+                    if debug_info.get('searchResults', 0) == 0 and debug_info.get('feedCards', 0) == 0:
+                        print(f"[Scraper Debug] Page text preview: {debug_info.get('bodyPreview', '')[:150]}")
+            except Exception as e:
+                print(f"[Scraper Debug] Note: {e}")
+
         # ── 1. Expand truncated post text ('...see more' toggles only) ─
         try:
             page.evaluate("""() => {
@@ -278,7 +305,7 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
                 const actionBtns = Array.from(document.querySelectorAll("button")).filter(b => {
                     const aria = (b.getAttribute("aria-label") || "").toLowerCase();
                     const txt = (b.innerText || "").trim().toLowerCase();
-                    return aria.includes("reaction button") || aria.includes("like") || txt === "like";
+                    return aria.includes("reaction") || aria.includes("react") || aria.includes("like") || txt === "like" || txt === "react";
                 });
 
                 const uniqueCards = [];
@@ -358,6 +385,64 @@ def scrape_posts_for_hashtag(page: Page, hashtag_query: str) -> list[dict]:
                         post_url: postUrl,
                         text: postText
                     });
+                });
+
+                // Secondary pass: direct card containers in case action buttons vary
+                const directContainers = Array.from(document.querySelectorAll(
+                    "li.reusable-search__result-container, div.reusable-search__result-container, [data-urn*='urn:li:activity:'], [data-urn*='urn:li:ugcPost:'], div.feed-shared-update-v2, div[data-view-name*='feed-full-update'], div[data-view-name*='search-entity-result']"
+                ));
+                directContainers.forEach(card => {
+                    if (seenCards.has(card)) return;
+                    seenCards.add(card);
+                    let name = "Recruiter";
+                    const nameLink = Array.from(card.querySelectorAll("a[href*='/in/']"))
+                        .find(a => a.innerText && a.innerText.trim().length > 2 && !a.innerText.toLowerCase().includes("portfolio"));
+                    if (nameLink) {
+                        const rawText = nameLink.innerText.trim();
+                        name = rawText.split("•")[0].split(String.fromCharCode(10))[0].trim() || "Recruiter";
+                    }
+                    let company = "";
+                    const actorDesc = card.querySelector(".update-components-actor__description, .feed-shared-actor__description, .update-components-actor__sub-description");
+                    if (actorDesc && actorDesc.innerText) {
+                        company = actorDesc.innerText.split(String.fromCharCode(10))[0].trim().slice(0, 100);
+                    }
+                    let postUrl = "";
+                    const postLink = card.querySelector("a[href*='/feed/update/'], a[href*='/posts/'], a[href*='activity:'], a[href*='/jobs/view/']");
+                    if (postLink && postLink.href) {
+                        postUrl = postLink.href.split("?")[0];
+                    } else {
+                        const urnHolder = card.closest("[data-urn*='urn:li:'], [data-id*='urn:li:']") || card.querySelector("[data-urn*='urn:li:'], [data-id*='urn:li:']");
+                        if (urnHolder) {
+                            const urn = urnHolder.getAttribute("data-urn") || urnHolder.getAttribute("data-id") || "";
+                            const m = urn.match(/urn:li:(?:activity|ugcPost):\d+/);
+                            if (m) postUrl = `https://www.linkedin.com/feed/update/${m[0]}/`;
+                        }
+                    }
+                    let postText = "";
+                    const commentarySelectors = [
+                        "[data-test-id='main-feed-activity-card__commentary']",
+                        ".feed-shared-update-v2__description",
+                        ".update-components-text",
+                        ".feed-shared-inline-show-more-text",
+                        "div.update-components-update-v2__commentary",
+                    ];
+                    for (const sel of commentarySelectors) {
+                        const el = card.querySelector(sel);
+                        if (el && el.innerText && el.innerText.trim().length >= 20) {
+                            postText = el.innerText.trim();
+                            break;
+                        }
+                    }
+                    if (!postText) postText = card.innerText || "";
+                    if (postText.trim().length >= 20) {
+                        uniqueCards.push({
+                            name: name,
+                            profile_url: nameLink ? nameLink.href.split("?")[0] : "",
+                            company: company,
+                            post_url: postUrl,
+                            text: postText
+                        });
+                    }
                 });
 
                 return uniqueCards;
@@ -454,9 +539,10 @@ def run_scraper(page: Page) -> list[dict]:
         except SessionInterruptedError as e:
             print(f"\n[Scraper] 🛑 LinkedIn session interrupted ({e})")
             print("[Scraper]    Stopping further queries cleanly instead of looping on a logged-out browser.")
-            if os.path.exists(COOKIE_FILE):
+            cookie_file = Config.get_cookie_file()
+            if os.path.exists(cookie_file):
                 try:
-                    os.remove(COOKIE_FILE)
+                    os.remove(cookie_file)
                     print("[Scraper]    Removed expired cookies.json — next run will re-authenticate.")
                 except OSError:
                     pass

@@ -35,7 +35,9 @@ def build_signature() -> str:
         f"Email: {Config.SMTP_EMAIL}",
     ]
 
-    # Optional fields — only added if set in .env
+    # Optional fields — only added if set in profile/env
+    if Config.YOUR_LOCATION:
+        lines.append(f"Location: {Config.YOUR_LOCATION}")
     if Config.YOUR_LINKEDIN:
         lines.append(f"LinkedIn: {Config.YOUR_LINKEDIN}")
     if Config.YOUR_GITHUB:

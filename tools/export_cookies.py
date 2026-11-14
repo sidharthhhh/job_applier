@@ -13,24 +13,26 @@ How to use:
 ─────────────────────────────────────────────────────────────
 """
 
+import argparse
 import json
 import os
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-SESSION_DIR  = os.path.join(os.path.dirname(__file__), "..", "session")
-COOKIE_FILE  = os.path.join(SESSION_DIR, "cookies.json")
+from config import Config
 
 
 def export_via_playwright() -> bool:
     """
-    Better method: Open Playwright with real Chrome, you login once,
-    cookies are captured automatically.
-    This is the most reliable approach.
+    Open Playwright with persistent Chrome profile, login once,
+    and capture cookies into the active profile's session directory.
     """
+    session_dir = Config.get_session_dir()
+    cookie_file = Config.get_cookie_file()
+    profile_dir = Config.get_chrome_profile_dir()
+
     print("\n" + "=" * 55)
-    print("COOKIE EXPORT VIA PLAYWRIGHT + REAL CHROME")
+    print(f"COOKIE EXPORT VIA PLAYWRIGHT ({Config.PROFILE_NAME})")
     print("=" * 55)
     print("This will open a Chrome window.")
     print("Login to LinkedIn, then come back here and press ENTER.")
@@ -38,10 +40,8 @@ def export_via_playwright() -> bool:
 
     try:
         from playwright.sync_api import sync_playwright
-        import time
 
-        os.makedirs(SESSION_DIR, exist_ok=True)
-        profile_dir = os.path.join(SESSION_DIR, "chrome_profile")
+        os.makedirs(session_dir, exist_ok=True)
         os.makedirs(profile_dir, exist_ok=True)
 
         with sync_playwright() as p:
@@ -88,13 +88,14 @@ def export_via_playwright() -> bool:
                 context.close()
                 return False
 
-            with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            with open(cookie_file, "w", encoding="utf-8") as f:
                 json.dump(linkedin_cookies, f, indent=2)
 
             context.close()
             print(f"\n✅ {len(linkedin_cookies)} LinkedIn cookies saved to:")
-            print(f"   {COOKIE_FILE} (+ persistent profile: {profile_dir})")
-            print("\n✅ Now run: python main.py")
+            print(f"   {cookie_file} (+ persistent profile: {profile_dir})")
+            profile_flag = f" --profile {Config.PROFILE_NAME}" if Config.PROFILE_NAME != "default" else ""
+            print(f"\n✅ Now run: python main.py{profile_flag}")
             print("   Login step will be skipped automatically!")
             return True
 
@@ -104,8 +105,14 @@ def export_via_playwright() -> bool:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="LinkedIn Cookie Export Tool")
+    parser.add_argument("--profile", type=str, default=None, help="Profile name (e.g., sakshi)")
+    args = parser.parse_args()
+    if args.profile:
+        Config.load(args.profile)
+
     print("=" * 55)
-    print("  LinkedIn Cookie Export Tool")
+    print(f"  LinkedIn Cookie Export Tool (profile: {Config.PROFILE_NAME})")
     print("  Backup login method for job_applier")
     print("=" * 55)
 

@@ -55,6 +55,27 @@ HIRING_SIGNAL_REGEX = re.compile(
 )
 
 _KEYWORD_CACHE: tuple[tuple[str, ...], list[tuple[str, re.Pattern, str]]] | None = None
+_LEADERSHIP_CACHE: tuple[tuple[str, ...], re.Pattern | None] | None = None
+
+
+def _get_leadership_regex() -> re.Pattern | None:
+    """Compile exclusion regex dynamically from Config.EXCLUDE_TITLE_KEYWORDS."""
+    global _LEADERSHIP_CACHE
+    raw = tuple(k.strip().lower() for k in Config.EXCLUDE_TITLE_KEYWORDS if k.strip())
+    if _LEADERSHIP_CACHE is not None and _LEADERSHIP_CACHE[0] == raw:
+        return _LEADERSHIP_CACHE[1]
+    if not raw:
+        _LEADERSHIP_CACHE = (raw, None)
+        return None
+    joined = "|".join(re.escape(k) for k in raw)
+    compiled = re.compile(
+        r'\b(?:hiring|looking\s+for|seeking|role|position|opening(?:s)?\s+for)\b'
+        r'[\s:\-]*(?:a\s+|an\s+|for\s+|the\s+)?(?:senior\s+|sr\.?\s+|lead\s+)?'
+        rf'({joined})\b',
+        re.IGNORECASE,
+    )
+    _LEADERSHIP_CACHE = (raw, compiled)
+    return compiled
 
 
 def _get_compiled_keywords() -> list[tuple[str, re.Pattern, str]]:
@@ -157,11 +178,13 @@ def is_job_relevant(post_text: str) -> tuple[bool, str]:
     if not matched_keywords:
         return False, "No matching profile keywords found in post"
 
-    # ── 2. Check Leadership Title Mismatch ─────────────────────
+    # ── 2. Check Leadership / Excluded Title Mismatch ──────────
     if Config.MAX_TARGET_EXPERIENCE <= 4:
-        leadership_match = LEADERSHIP_HIRING_REGEX.search(post_text)
-        if leadership_match:
-            return False, f"Post requires senior leadership ({leadership_match.group(1)})"
+        leadership_re = _get_leadership_regex()
+        if leadership_re:
+            leadership_match = leadership_re.search(post_text)
+            if leadership_match:
+                return False, f"Post requires excluded seniority ({leadership_match.group(1)})"
 
     # ── 3. Check Years of Experience ──────────────────────────
     exp_info = extract_required_experience(post_text)

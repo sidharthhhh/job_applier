@@ -39,8 +39,14 @@ def print_banner():
     """)
 
 
-def print_mode_banner(scrape_mode: bool):
-    if scrape_mode:
+def print_mode_banner(scrape_mode: bool, scrape_only: bool = False):
+    if scrape_only:
+        print("""
+┌──────────────────────────────────────────────────────────┐
+│  🔍 MODE: SCRAPE-ONLY (LinkedIn ➜ Extract ➜ MongoDB)     │
+│     Scrape posts ➜ Extract emails ➜ Save to DB (no send) │
+└──────────────────────────────────────────────────────────┘""")
+    elif scrape_mode:
         print("""
 ┌──────────────────────────────────────────────────────────┐
 │  🟢 MODE: FULL PIPELINE                                  │
@@ -61,8 +67,14 @@ def print_step(step: int, title: str):
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse optional CLI overrides for dry-run and scrape mode."""
+    """Parse optional CLI overrides for profile, dry-run, and scrape mode."""
     parser = argparse.ArgumentParser(description="LinkedIn AI Job Application Automator")
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="Profile folder under profiles/<name>/profile.env (e.g. --profile sakshi)",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -84,13 +96,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Force full scraping + email pipeline regardless of SCRAPE_MODE in .env",
     )
+    mode_group.add_argument(
+        "--scrape-only",
+        action="store_true",
+        help="Only scrape LinkedIn posts and save extracted emails to MongoDB (skip AI & SMTP)",
+    )
     return parser.parse_args(argv)
 
 
-def run_pipeline():
+def run_pipeline(scrape_only: bool = False):
     """Main pipeline execution"""
     print_banner()
-    print_mode_banner(Config.SCRAPE_MODE)
+    print_mode_banner(Config.SCRAPE_MODE, scrape_only=scrape_only)
     if Config.DRY_RUN:
         print("  🧪 DRY RUN ENABLED — Emails will be drafted and previewed, NOT sent.\n")
     start_time = datetime.now()
@@ -98,38 +115,42 @@ def run_pipeline():
     # ── Validate Config ────────────────────────────────────
     print("[Init] Validating configuration...")
     try:
-        Config.validate()
-        Config.display()
+        Config.validate(
+            check_smtp=not (Config.DRY_RUN or scrape_only),
+            check_resume=not scrape_only,
+        )
+        Config.display(scrape_only=scrape_only)
     except ValueError as e:
         print(f"\n{e}")
         sys.exit(1)
 
     # ── Check AI Provider Status ───────────────────────────
-    print(f"\n[Init] Checking AI provider ({Config.AI_PROVIDER})...")
-    llm_status = check_llm_status()
-    if llm_status["running"]:
-        print(
-            f"[Init] ✅ {Config.AI_PROVIDER.upper()} ready | "
-            f"Model '{llm_status['configured_model']}' available: {llm_status['model_available']} "
-            f"({llm_status.get('note', '')})"
-        )
-        if not llm_status["model_available"] and llm_status.get("available_models"):
-            print(f"[Init] ⚠️  Available models: {llm_status['available_models']}")
-    else:
-        print(f"[Init] ⚠️  {llm_status.get('note', 'AI provider unavailable')}.")
-
-    fb_status = llm_status.get("fallback")
-    if fb_status:
-        fb_name = fb_status["provider"].upper()
-        if fb_status["running"]:
+    if not scrape_only:
+        print(f"\n[Init] Checking AI provider ({Config.AI_PROVIDER})...")
+        llm_status = check_llm_status()
+        if llm_status["running"]:
             print(
-                f"[Init] 🔁 Fallback {fb_name} ready | "
-                f"Model '{fb_status['configured_model']}' available: {fb_status['model_available']}"
+                f"[Init] ✅ {Config.AI_PROVIDER.upper()} ready | "
+                f"Model '{llm_status['configured_model']}' available: {llm_status['model_available']} "
+                f"({llm_status.get('note', '')})"
             )
+            if not llm_status["model_available"] and llm_status.get("available_models"):
+                print(f"[Init] ⚠️  Available models: {llm_status['available_models']}")
         else:
-            print(f"[Init] ⚠️  Fallback {fb_name} not ready ({fb_status.get('note', '')}) — DevOps templates will be used if primary fails.")
-    elif not llm_status["running"]:
-        print("[Init] ℹ️  Will use DevOps fallback email templates.")
+            print(f"[Init] ⚠️  {llm_status.get('note', 'AI provider unavailable')}.")
+
+        fb_status = llm_status.get("fallback")
+        if fb_status:
+            fb_name = fb_status["provider"].upper()
+            if fb_status["running"]:
+                print(
+                    f"[Init] 🔁 Fallback {fb_name} ready | "
+                    f"Model '{fb_status['configured_model']}' available: {fb_status['model_available']}"
+                )
+            else:
+                print(f"[Init] ⚠️  Fallback {fb_name} not ready ({fb_status.get('note', '')}) — DevOps templates will be used if primary fails.")
+        elif not llm_status["running"]:
+            print("[Init] ℹ️  Will use DevOps fallback email templates.")
 
     # ── Connect to MongoDB ─────────────────────────────────
     print("\n[Init] Connecting to MongoDB...")
@@ -198,6 +219,30 @@ def run_pipeline():
             print(f"[Pipeline] 💾 {new_emails} new emails saved | {len(email_records) - new_emails} already in DB")
         else:
             print("[Pipeline] ℹ️  No relevant posts found in this scrape.")
+
+        if scrape_only:
+            elapsed = int((datetime.now() - start_time).total_seconds())
+            stats = db.get_stats()
+            profile_flag = f" --profile {Config.PROFILE_NAME}" if Config.PROFILE_NAME != "default" else ""
+            print(f"""
+╔══════════════════════════════════════════════════════════╗
+║                 SCRAPE-ONLY COMPLETE ✅                  ║
+╠══════════════════════════════════════════════════════════╣
+║  Database               : {Config.MONGO_DB:<30}║
+║  Posts Scraped Today    : {len(all_posts):<30}║
+║  Relevant Posts         : {len(relevant_posts):<30}║
+║  Emails Extracted Today : {len(email_records):<30}║
+║  New Emails Saved       : {len(newly_saved_emails):<30}║
+╠══════════════════════════════════════════════════════════╣
+║  Total Posts in DB      : {stats['total_posts_scraped']:<30}║
+║  Total Emails in DB     : {stats['total_emails_extracted']:<30}║
+║  Time Taken             : {f"{elapsed}s":<30}║
+╚══════════════════════════════════════════════════════════╝
+ℹ️  Emails saved as pending. To send later (once SMTP is set):
+   python main.py{profile_flag} --email-only
+""")
+            db.close()
+            return
 
     else:
         # ─────────────────────────────────────────────────────────
@@ -383,6 +428,13 @@ def run_pipeline():
 
 if __name__ == "__main__":
     args = parse_args()
+    try:
+        if args.profile:
+            Config.load(args.profile)
+    except ValueError as e:
+        print(f"\n{e}")
+        sys.exit(1)
+
     if args.test_smtp:
         try:
             Config.validate()
@@ -395,6 +447,6 @@ if __name__ == "__main__":
         Config.DRY_RUN = True
     if args.email_only:
         Config.SCRAPE_MODE = False
-    elif args.scrape:
+    elif args.scrape or args.scrape_only:
         Config.SCRAPE_MODE = True
-    run_pipeline()
+    run_pipeline(scrape_only=args.scrape_only)

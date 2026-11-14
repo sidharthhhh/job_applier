@@ -36,6 +36,8 @@ class MongoHandler:
         # Index on sent_at for cooldown and daily quota queries
         self.sent.create_index([("email", ASCENDING), ("sent_at", DESCENDING)])
         self.sent.create_index([("sent_at", DESCENDING)])
+        # Index on email_responses so the collection is provisioned & fast to query
+        self.responses.create_index([("email", ASCENDING), ("received_at", DESCENDING)])
 
         # Partial unique index on non-empty post_url so posts lacking URLs don't collide on ""
         try:
